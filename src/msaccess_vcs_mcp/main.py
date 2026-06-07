@@ -257,12 +257,25 @@ def main() -> None:
         log_file=str(usage_path) if usage_path else None,
     )
 
+    # Parse transport arguments
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--transport", default="stdio", choices=["stdio", "sse"])
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    args, _ = parser.parse_known_args()
+
     # Import and run MCP server
     from .tools import mcp
-    log_diagnostic_event("mcp_stdio_run_start", session_id=_session_id)
+    transport_label = f"mcp_{args.transport}_run"
+    log_diagnostic_event(f"{transport_label}_start", session_id=_session_id)
     try:
-        mcp.run(transport="stdio")
-        log_diagnostic_event("mcp_stdio_run_returned", session_id=_session_id)
+        if args.transport == "sse":
+            print(f"Starting SSE server on {args.host}:{args.port}", file=sys.stderr)
+            mcp.run(transport="sse", host=args.host, port=args.port)
+        else:
+            mcp.run(transport="stdio")
+        log_diagnostic_event(f"{transport_label}_returned", session_id=_session_id)
     except BaseException as e:
         log_diagnostic_event(
             "fatal_exit",
