@@ -96,6 +96,18 @@ Key variables:
 
 The server writes two parallel JSON Lines streams. Both filenames use the `vcs-mcp-` prefix so they don't collide with other tools that share the same logs directory.
 
+### VCS operation logs (written by the add-in, not the server)
+
+Separate from the two streams below, the add-in writes a per-operation log to `{source_dir}/logs/<Base>_<yyyymmdd_hhnnss_fff>.log`, where `<Base>` is `Export`, `Merge`, `Build`, `TestRun`, or `Other`. Note the base name tracks the *operation*, not the tool: `vcs_import_objects` and `vcs_import_object` both produce `Merge_*.log`.
+
+The add-in also writes a `.gitignore` into the source folder containing `logs/` and `*.log`, which means **Cursor's Glob and Grep silently skip these files** — a search returns no matches rather than an error, so an agent can burn several calls before falling back to a shell listing. To avoid that:
+
+- Every operation tool returns `log_path` for the run it just performed. Use it directly with the Read tool.
+- On failure, those tools also return `log_excerpt` (tail of the log), so the error is usually available without any follow-up call.
+- If the path is no longer at hand, call `vcs_get_log(database_path, log_type=...)` with the base name matching the operation.
+
+The add-in's sync API returns this as camelCase `logPath`; `_addin_json_result` in `tools.py` normalizes it to `log_path` at the boundary and keeps the original key as an alias. Async completion callbacks already use `log_path`. Keep the normalizer even if the add-in changes: a newer server may run against an older add-in build.
+
 ### Diagnostic stream (`vcs-mcp-diagnostic.jsonl`) — always on
 
 Captures server lifecycle events: `server_start`, `startup_env_load`, `lazy_env_load`, `lazy_init_started`, `lazy_init_skipped`, `list_roots_failed`, `list_roots_response`, `lazy_init_loaded`, `lazy_init_no_env_in_roots`, `usage_log_status`. Independent of `ACCESS_VCS_ENABLE_LOGGING` so it answers the "why didn't logging work?" question even when usage logging is silent.

@@ -74,6 +74,35 @@ contradictory guidance.
 
 ---
 
+## 2026-07-30 — Reaching the add-in API from MCP: vcs_call_vba, not vcs_run_vba
+
+**Trigger**: An agent spent a long session trying to run the add-in's round-trip test harness (`VCS.RunRoundtripTests`) through `vcs_run_vba`. Every attempt returned an empty string. That looked like a broken add-in, then a stuck Access instance, and the workaround attempted next (`HandleRibbonCommand`) corrupted the host VBA project with error 2517 and required closing and reopening the database. The session ended by telling the user to paste a command into the Immediate window — for a capability the tools already had.
+
+The cause is structural. `vcs_run_vba` is itself delivered through `modAPI.API`, which has a `Static IsRunning` re-entrancy guard. Submitted code therefore runs *inside* an API call, and anything it calls back into the API is nested by construction and refused. The guard returned `Empty` silently, which is indistinguishable from a method that legitimately returned nothing.
+
+Three separate defects turned a one-line answer into a multi-hour dead end:
+
+1. `vcs_call_vba` — the tool that does work — documented `"Version Control.API"` as its example. That never resolves. `Application.Run` matches a loaded VBA *project* name (`MSAccessVCS`), not the file name (`Version Control`). `"MSAccessVCS.API"` works but only once something has already loaded the add-in; only the full path is correct from a cold start.
+2. `vcs_call_vba` did not unwrap the result. Early-bound `Run` returns a 31-element tuple — the return value followed by `Run`'s own 30 `Arg` slots, unused ones showing `DISP_E_PARAMNOTFOUND` (`-2147352572`). `VCSAddinIntegration.call_api_function` already handled this; the generic tool did not, so callers saw the payload buried in noise.
+3. Nothing in the tool descriptions said which tool reaches the API, or that `vcs_run_vba` structurally cannot.
+
+**Options explored**:
+- *Document the full path and move on*: rejected. It puts an install-specific absolute path in every call and still leaves the silent-`Empty` trap for the next agent.
+- *Relax the re-entrancy guard to allow nesting*: rejected. The guard protects `Operation` state owned by the outer call. The nested call is genuinely unserviceable; the defect is that it was refused silently, not that it was refused.
+- *Resolve an alias qualifier server-side* (chosen): the server already knows `ACCESS_VCS_ADDIN_PATH`.
+
+**Decision**: `vcs_call_vba` now accepts `"VCS.API"` (also `"Version Control.API"`, `"MSAccessVCS.API"`, case-insensitive) and rewrites the qualifier to the configured add-in's full path, which loads it on demand. Any other qualifier passes through untouched, so an explicit path or a user's own module still works. The result tuple is unwrapped to its first element, matching `call_api_function`. A "cannot find the procedure" failure now explains the project-name-versus-file-name rule. Server instructions name `vcs_call_vba` as the route to API methods and state that `vcs_run_vba` cannot be.
+
+Paired with an add-in change: `modAPI.API` and `APIAsync` now return a message naming the refused method and pointing at `vcs_call_vba`, instead of returning `Empty`. `API` prefixes it with `API_REFUSED_PREFIX` (`"VCS_API_REFUSED: "`); `APIAsync` embeds it in its JSON. `vcs_call_vba` matches the prefix and reports `success: False` so a refusal is never mistaken for data.
+
+That started as an `Err.Raise` and had to be changed after testing. An error raised inside a library database does not propagate across `Application.Run` into the calling project's handler — even with `On Error GoTo` active in the caller, Access shows a modal "Run-time error" dialog and blocks until a human dismisses it. Since this guard only trips on a nested call, which is by definition the case that crosses that boundary, raising was guaranteed to hit it. A blocking dialog is worse for automation than the silence it replaced, so the refusal travels as a marked return value instead.
+
+**What this rules out**: Calling add-in API methods from inside `vcs_run_vba` — use `vcs_call_vba`. Adding tools that wrap individual API methods (`vcs_run_roundtrip_tests` and the like); the generic route now works and does not need per-method surface. Treating a `Run` result as a scalar anywhere else without unwrapping the tuple first. One accepted risk: a user module genuinely named `VCS` would have its qualifier rewritten — revisit if that ever surfaces.
+
+**Relevant files**: `src/msaccess_vcs_mcp/tools.py` (`vcs_call_vba`, `_resolve_addin_function_name`, `_describe_run_failure`, server instructions); add-in `modules/API/modAPI.bas` (`RefuseReentrantCall`, `ERR_API_REENTRANT`).
+
+---
+
 ## 2026-04-30 — EnsureDispatch ownership fix (DispatchEx fallback)
 
 **Trigger**: Disabling the MCP tool in Cursor killed the user's Access window (with their open database). `AccessConnection._get_access_app()` called `EnsureDispatch("Access.Application")` when `GetObject(db_path)` failed, but `EnsureDispatch` can silently attach to an already-running user-owned Access instance instead of creating a new one. The code set `_owns_app = True` unconditionally, so `close()` called `_app.Quit()` on the user's session. This is the exact bug db-inspector-mcp fixed in their "DispatchEx fallback for COM instance conflicts" decision.

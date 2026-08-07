@@ -27,6 +27,7 @@ control the VCS add-in, not the Access application itself.
 
 import asyncio
 import functools
+import glob
 import inspect
 import json
 import os
@@ -71,6 +72,105 @@ _NOT_COMPILED_AGENT_GUIDANCE = (
     "(Debug → Compile) and paste the code snippet around any error line, "
     "or confirm the project compiles cleanly."
 )
+
+
+def _addin_json_result(result_json: Any, raw_key: str = "result") -> dict[str, Any]:
+    """
+    Parse a sync add-in API response into an MCP tool result.
+
+    The add-in's sync API uses camelCase keys (``logPath``, ``errorNumber``)
+    while MCP results use snake_case. Translating here keeps each side
+    idiomatic and lets a newer server work against an older add-in build that
+    only emits one of the two spellings.
+
+    Args:
+        result_json: Raw return value from ``VCSAddinIntegration.call_sync``
+        raw_key: Key to file the value under when it is not a JSON object
+    """
+    result = result_json
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except json.JSONDecodeError:
+            return {"success": True, raw_key: result_json}
+
+    if not isinstance(result, dict):
+        return {"success": True, raw_key: result_json}
+
+    # Keep the original camelCase key for one release so existing callers
+    # that already read logPath keep working.
+    log_path = result.get("log_path") or result.get("logPath")
+    if log_path:
+        result["log_path"] = log_path
+        result["logPath"] = log_path
+
+        if result.get("success") is False and "log_excerpt" not in result:
+            excerpt = _read_log_excerpt(log_path)
+            if excerpt:
+                result["log_excerpt"] = excerpt
+
+    return result
+
+
+def _newest_log(source_dir: str | os.PathLike[str], base_name: str) -> str | None:
+    """
+    Return the newest ``{source_dir}/logs/{base_name}_*.log``, or None.
+
+    Mirrors the add-in's own GetLogContent lookup. Log names embed a sortable
+    ``yyyymmdd_hhnnss_fff`` stamp, so lexical max is newest.
+    """
+    pattern = os.path.join(str(source_dir), "logs", f"{base_name}_*.log")
+    matches = glob.glob(pattern)
+    return max(matches) if matches else None
+
+
+def _read_log_excerpt(log_path: str, tail_lines: int = 50, max_chars: int = 4000) -> str | None:
+    """
+    Return the last ``tail_lines`` of a log file, truncated to ``max_chars``.
+
+    Callers surface this on failure so an agent gets the error inline. The
+    add-in gitignores its ``logs/`` folder, so Glob/Grep silently skip it and
+    an agent that has only a path still burns calls trying to read around it.
+    """
+    if not log_path or not os.path.exists(log_path):
+        return None
+
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return None
+
+    excerpt = "".join(lines[-tail_lines:]).strip()
+    if len(excerpt) > max_chars:
+        excerpt = "...(truncated)...\n" + excerpt[-max_chars:]
+    return excerpt or None
+
+
+def _attach_log_context(
+    result: dict[str, Any],
+    source_dir: str | os.PathLike[str],
+    base_name: str,
+    completion: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    Add ``log_path`` to a tool result, plus ``log_excerpt`` when it failed.
+
+    The add-in gitignores its ``logs/`` folder, so Glob/Grep skip it entirely
+    and an agent told only that "the build failed" cannot search its way to the
+    reason. Returning the tail inline on failure removes that dead end.
+    """
+    log_path = (completion or {}).get("log_path")
+    if not log_path or not os.path.exists(log_path):
+        # The operation just ran, so the newest log for this family is its own.
+        log_path = _newest_log(source_dir, base_name)
+
+    result["log_path"] = log_path
+    if not result.get("success") and log_path:
+        excerpt = _read_log_excerpt(log_path)
+        if excerpt:
+            result["log_excerpt"] = excerpt
+    return result
 
 
 def _get_operation_manager():
@@ -183,7 +283,14 @@ mcp = FastMCP(
         "Do NOT guess tool names like vcs_eval, vcs_execute_code, or vcs_run_code — "
         "they do not exist.\n"
         "- vcs_run_vba() returns values via a MCP_TempFunction pattern — "
-        "read the full tool description for details.\n\n"
+        "read the full tool description for details.\n"
+        "- To call a VCS add-in API method (Export, Build, RunTests, "
+        "RunRoundtripTests, ...), use vcs_call_vba(db, \"VCS.API\", [\"<Method>\", ...]). "
+        "Do NOT call the API from inside vcs_run_vba: that code is itself delivered "
+        "through modAPI.API, so calling back into the API is re-entrant and is refused.\n"
+        "- Application.Run qualifiers match a loaded VBA *project* name, not a file "
+        "name, so \"Version Control.API\" does not resolve. Pass \"VCS.API\" and the "
+        "server rewrites it to the add-in's full path.\n\n"
         "**Logs:**\n"
         "Two JSON Lines streams (both prefixed `vcs-mcp-` so they don't collide with "
         "other tools' logs in a shared directory).\n"
@@ -430,6 +537,11 @@ async def vcs_export_database(
         - export_path: Path where files were written
         - objects_by_type: Breakdown of what was exported
         - errors: List of any errors encountered
+        - log_path: Full path to this run's log file
+        - log_excerpt: Tail of the log, included only on failure
+    
+    The add-in gitignores its ``logs`` folder, so Glob/Grep will not find
+    these files. Open ``log_path`` directly, or call vcs_get_log("Export").
     """
     try:
         # Validate paths
@@ -496,7 +608,7 @@ async def vcs_export_database(
                     completion = None
                     if async_result.get("sync"):
                         # VBA returned sync result
-                        pass  # Fall through to count objects
+                        op_manager.unregister_operation(operation_id)
                     elif async_result.get("async"):
                         # Wait for completion with progress reporting
                         timeout_ms = async_result.get("timeout_ms", 300000)
@@ -507,13 +619,31 @@ async def vcs_export_database(
                         )
                         
                         if not completion.get("success"):
-                            return {
+                            return _attach_log_context({
                                 "success": False,
                                 "error": completion.get("error", "Export failed"),
                                 "exported_count": 0,
                                 "export_path": str(export_path),
                                 "objects_by_type": {},
-                            }
+                            }, export_path, "Export", completion)
+                    else:
+                        # Neither marker: the add-in never started the operation,
+                        # so run it synchronously rather than reporting success
+                        # for work that never happened.
+                        op_manager.unregister_operation(operation_id)
+                        if vba_only:
+                            result = addin.export_vba(str(db_path), str(export_path))
+                        else:
+                            result = addin.export_source(str(db_path), str(export_path))
+                        
+                        if not result["success"]:
+                            return _attach_log_context({
+                                "success": False,
+                                "error": result["message"],
+                                "exported_count": 0,
+                                "export_path": str(export_path),
+                                "objects_by_type": {},
+                            }, export_path, "Export")
                 except Exception as e:
                     # Async call failed - fall back to sync
                     completion = None
@@ -525,13 +655,13 @@ async def vcs_export_database(
                         result = addin.export_source(str(db_path), str(export_path))
                     
                     if not result["success"]:
-                        return {
+                        return _attach_log_context({
                             "success": False,
                             "error": result["message"],
                             "exported_count": 0,
                             "export_path": str(export_path),
                             "objects_by_type": {},
-                        }
+                        }, export_path, "Export")
             else:
                 # Use sync path (no callbacks available)
                 completion = None
@@ -541,33 +671,19 @@ async def vcs_export_database(
                     result = addin.export_source(str(db_path), str(export_path))
                 
                 if not result["success"]:
-                    return {
+                    return _attach_log_context({
                         "success": False,
                         "error": result["message"],
                         "exported_count": 0,
                         "export_path": str(export_path),
                         "objects_by_type": {},
-                    }
+                    }, export_path, "Export")
             
-            # Get log path and messages from callback result
-            log_path = None
-            log_messages = None
-            if completion:
-                log_path = completion.get("log_path")
-                log_messages = completion.get("log_messages")
-            
-            if not log_path:
-                # Fallback to legacy location
-                legacy_path = os.path.join(str(export_path), "Export.log")
-                if os.path.exists(legacy_path):
-                    log_path = legacy_path
-            
-            return {
+            return _attach_log_context({
                 "success": True,
                 "export_path": str(export_path),
-                "log_path": log_path if (log_path and os.path.exists(log_path)) else None,
-                "messages": log_messages,
-            }
+                "messages": (completion or {}).get("log_messages"),
+            }, export_path, "Export", completion)
     
     except Exception as e:
         return {
@@ -778,7 +894,11 @@ async def vcs_import_objects(
         overwrite: If True, replace existing objects; if False, skip
     
     Returns:
-        Dictionary with import results and any errors
+        Dictionary with import results and any errors, plus ``log_path`` for
+        this run's log and ``log_excerpt`` (tail of the log) on failure.
+    
+    The add-in gitignores its ``logs`` folder, so Glob/Grep will not find
+    these files. Open ``log_path`` directly, or call vcs_get_log("Merge").
     """
     config = get_config()
     callback_url = get_callback_url()
@@ -845,49 +965,56 @@ async def vcs_import_objects(
                         )
                         
                         if not completion.get("success"):
-                            return {
+                            return _attach_log_context({
                                 "success": False,
                                 "error": completion.get("error", "Import failed"),
                                 "imported_count": 0,
-                            }
+                            }, src_path, "Merge", completion)
+                    elif async_result.get("sync"):
+                        # The add-in already ran the merge inline; re-running it
+                        # here would merge twice. Fall through and resolve the
+                        # log from disk.
+                        op_manager.unregister_operation(operation_id)
+                    else:
+                        # Neither marker: the add-in never started the operation,
+                        # so run it synchronously rather than reporting success
+                        # for work that never happened.
+                        op_manager.unregister_operation(operation_id)
+                        result = addin.merge_build(str(db_path), str(src_path))
+                        if not result["success"]:
+                            return _attach_log_context({
+                                "success": False,
+                                "error": result["message"],
+                                "imported_count": 0,
+                            }, src_path, "Merge")
                 except Exception as e:
                     # Async call failed - fall back to sync
                     completion = None
                     op_manager.unregister_operation(operation_id)
                     result = addin.merge_build(str(db_path), str(src_path))
                     if not result["success"]:
-                        return {
+                        return _attach_log_context({
                             "success": False,
                             "error": result["message"],
                             "imported_count": 0,
-                        }
+                        }, src_path, "Merge")
             else:
                 # Use sync path
                 completion = None
                 result = addin.merge_build(str(db_path), str(src_path))
                 if not result["success"]:
-                    return {
+                    return _attach_log_context({
                         "success": False,
                         "error": result["message"],
                         "imported_count": 0,
-                    }
+                    }, src_path, "Merge")
             
-            # Get log path from callback result, or use legacy path as fallback
-            log_path = None
-            if completion:
-                log_path = completion.get("log_path")
-            if not log_path:
-                legacy_path = os.path.join(str(src_path), "Build.log")
-                if os.path.exists(legacy_path):
-                    log_path = legacy_path
-            
-            return {
+            return _attach_log_context({
                 "success": True,
                 "imported_count": "See log for details",
                 "database_path": str(db_path),
                 "source_dir": str(src_path),
-                "log_path": log_path if (log_path and os.path.exists(log_path)) else None,
-            }
+            }, src_path, "Merge", completion)
     
     except PermissionError as e:
         return {
@@ -936,7 +1063,11 @@ async def vcs_rebuild_database(
         template_path: Optional template database to start from
     
     Returns:
-        Dictionary with build results
+        Dictionary with build results, plus ``log_path`` for this run's log
+        and ``log_excerpt`` (tail of the log) on failure.
+    
+    The add-in gitignores its ``logs`` folder, so Glob/Grep will not find
+    these files. Open ``log_path`` directly, or call vcs_get_log("Build").
     """
     config = get_config()
     callback_url = get_callback_url()
@@ -999,48 +1130,55 @@ async def vcs_rebuild_database(
                         )
                         
                         if not completion.get("success"):
-                            return {
+                            return _attach_log_context({
                                 "success": False,
                                 "error": completion.get("error", "Build failed"),
                                 "output_path": None,
-                            }
+                            }, src_path, "Build", completion)
+                    elif async_result.get("sync"):
+                        # The add-in already ran the build inline; re-running it
+                        # here would build twice. Fall through and resolve the
+                        # log from disk.
+                        op_manager.unregister_operation(operation_id)
+                    else:
+                        # Neither marker: the add-in never started the operation,
+                        # so run it synchronously rather than reporting success
+                        # for work that never happened.
+                        op_manager.unregister_operation(operation_id)
+                        result = addin.build_from_source(str(src_path), output_path)
+                        if not result["success"]:
+                            return _attach_log_context({
+                                "success": False,
+                                "error": result["message"],
+                                "output_path": None,
+                            }, src_path, "Build")
                 except Exception as e:
                     # Async call failed - fall back to sync
                     completion = None
                     op_manager.unregister_operation(operation_id)
                     result = addin.build_from_source(str(src_path), output_path)
                     if not result["success"]:
-                        return {
+                        return _attach_log_context({
                             "success": False,
                             "error": result["message"],
                             "output_path": None,
-                        }
+                        }, src_path, "Build")
             else:
                 # Use sync path
                 completion = None
                 result = addin.build_from_source(str(src_path), output_path)
                 if not result["success"]:
-                    return {
+                    return _attach_log_context({
                         "success": False,
                         "error": result["message"],
                         "output_path": None,
-                    }
+                    }, src_path, "Build")
             
-            # Get log path from callback result, or use legacy path as fallback
-            log_path = None
-            if completion:
-                log_path = completion.get("log_path")
-            if not log_path:
-                legacy_path = os.path.join(str(src_path), "Build.log")
-                if os.path.exists(legacy_path):
-                    log_path = legacy_path
-            
-            return {
+            return _attach_log_context({
                 "success": True,
                 "output_path": output_path,
                 "source_dir": str(src_path),
-                "log_path": log_path if (log_path and os.path.exists(log_path)) else None,
-            }
+            }, src_path, "Build", completion)
         finally:
             try:
                 app.Quit()
@@ -1367,7 +1505,11 @@ def vcs_export_object(
             types, ignored for single-file types.
     
     Returns:
-        Dictionary with success status, file path, and any errors
+        Dictionary with success status, file path, and any errors, plus
+        ``log_path`` for this run's log and ``log_excerpt`` on failure.
+    
+    The add-in gitignores its ``logs`` folder, so Glob/Grep will not find
+    these files. Open ``log_path`` directly, or call vcs_get_log("Export").
     """
     try:
         db_path = validate_database_path(database_path)
@@ -1381,13 +1523,7 @@ def vcs_export_object(
             
             result_json = addin.call_sync("ExportObject", object_type, object_name)
             
-            if isinstance(result_json, str):
-                try:
-                    return json.loads(result_json)
-                except json.JSONDecodeError:
-                    return {"success": True, "result": result_json}
-            
-            return {"success": True, "result": result_json}
+            return _addin_json_result(result_json)
     
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -1428,7 +1564,11 @@ def vcs_import_object(
             types, ignored for single-file types.
     
     Returns:
-        Dictionary with success status and any errors
+        Dictionary with success status and any errors, plus ``log_path`` for
+        this run's log and ``log_excerpt`` (tail of the log) on failure.
+    
+    The add-in gitignores its ``logs`` folder, so Glob/Grep will not find
+    these files. Open ``log_path`` directly, or call vcs_get_log("Merge").
     """
     try:
         config = get_config()
@@ -1444,13 +1584,7 @@ def vcs_import_object(
             
             result_json = addin.call_sync("ImportObject", object_type, object_name)
             
-            if isinstance(result_json, str):
-                try:
-                    return json.loads(result_json)
-                except json.JSONDecodeError:
-                    return {"success": True, "result": result_json}
-            
-            return {"success": True, "result": result_json}
+            return _addin_json_result(result_json)
     
     except PermissionError as e:
         return {"success": False, "error": str(e)}
@@ -1522,59 +1656,125 @@ def vcs_call_vba(
     Invokes a function that already exists in the database or a loaded library
     via Application.Run. Lighter weight than vcs_run_vba since there is no
     temp module creation or compilation step.
-    
+
+    **This is the correct tool for reaching the VCS add-in's own API.** Pass "VCS.API"
+    (or "Version Control.API" / "MSAccessVCS.API") as function_name and it is rewritten
+    to the configured add-in's full path, which also loads the add-in on demand. Do NOT
+    try to reach the API from inside vcs_run_vba: that code is itself delivered through
+    modAPI.API, so calling back into the API is a re-entrant call and will be refused.
+
     Examples:
         vcs_call_vba("C:\\\\db.accdb", "MyModule.GetQuerySQL", ["qryCustomers"])
-        vcs_call_vba("C:\\\\db.accdb", "Version Control.API", ["GetVCSVersion"])
-    
+        vcs_call_vba("C:\\\\db.accdb", "VCS.API", ["GetVCSVersion"])
+        vcs_call_vba("C:\\\\db.accdb", "VCS.API", ["RunRoundtripTests", "C:\\\\fixtures\\\\"])
+
     Args:
         database_path: Path to Access database (.accdb, .accda, .mdb)
-        function_name: Fully qualified function name (e.g., "ModuleName.FunctionName")
+        function_name: Fully qualified function name (e.g., "ModuleName.FunctionName"),
+            or a VCS add-in alias such as "VCS.API"
         args: Optional list of string arguments to pass to the function
-    
+
     Returns:
         Dictionary with the function's return value or error
     """
     try:
         db_path = validate_database_path(database_path)
         call_args = args or []
-        call_description = function_name
+        resolved_name = _resolve_addin_function_name(function_name)
+        call_description = resolved_name
         if call_args:
             call_description += f"({', '.join(repr(a) for a in call_args)})"
         log_code_execution("vcs_call_vba", str(db_path), call_description, code_type="vba_call")
-        
+
+        if len(call_args) > 3:
+            return {
+                "success": False,
+                "error": "Maximum 3 arguments supported for vcs_call_vba"
+            }
+
         with AccessConnection(str(db_path)) as conn:
             app, db = conn.connect()
-            
+
             try:
-                if len(call_args) == 0:
-                    result = app.Run(function_name)
-                elif len(call_args) == 1:
-                    result = app.Run(function_name, call_args[0])
-                elif len(call_args) == 2:
-                    result = app.Run(function_name, call_args[0], call_args[1])
-                elif len(call_args) == 3:
-                    result = app.Run(function_name, call_args[0], call_args[1], call_args[2])
-                else:
-                    return {
-                        "success": False,
-                        "error": "Maximum 3 arguments supported for vcs_call_vba"
-                    }
+                result = app.Run(resolved_name, *call_args)
             except Exception as e:
                 return {
                     "success": False,
-                    "error": f"VBA function call failed: {e}",
-                    "function": function_name,
+                    "error": _describe_run_failure(e, resolved_name, function_name),
+                    "function": resolved_name,
                 }
-            
+
+            # Early-bound Run returns a tuple: the function's return value followed by
+            # Run's own 30 Arg slots (unused ones show DISP_E_PARAMNOTFOUND). Only the
+            # first element is ours. Matches VCSAddinIntegration.call_api_function.
+            if isinstance(result, tuple) and len(result) > 0:
+                result = result[0]
+
+            # A refused call comes back as a marked string rather than an exception --
+            # the add-in cannot raise across the library boundary without producing a
+            # modal dialog. Report it as a failure so it is not mistaken for data.
+            if isinstance(result, str) and result.startswith(_API_REFUSED_PREFIX):
+                return {
+                    "success": False,
+                    "error": result[len(_API_REFUSED_PREFIX):],
+                    "function": resolved_name,
+                }
+
             return {
                 "success": True,
                 "result": str(result) if result is not None else None,
-                "function": function_name,
+                "function": resolved_name,
             }
-    
+
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# Qualifiers that mean "the VCS add-in library". Application.Run resolves a bare
+# qualifier against the VBA *project* name (MSAccessVCS), not the file name
+# (Version Control), and only once the add-in is already loaded -- so the file-name
+# form never works and the project-name form works only sometimes. Rewriting to the
+# configured full path is correct from a cold start and loads the add-in on demand.
+_ADDIN_QUALIFIER_ALIASES = frozenset({"vcs", "version control", "msaccessvcs"})
+
+# Prefix the add-in puts on a refused (re-entrant) call. It returns a marked string
+# instead of raising because an error raised inside a library database does not
+# propagate across Application.Run -- it opens a modal dialog and blocks Access.
+# Keep in sync with modAPI.API_REFUSED_PREFIX.
+_API_REFUSED_PREFIX = "VCS_API_REFUSED: "
+
+def _resolve_addin_function_name(function_name: str) -> str:
+    """Rewrite a VCS add-in alias qualifier to the configured add-in's full path."""
+    qualifier, sep, member = function_name.rpartition(".")
+    if not sep or qualifier.lower() not in _ADDIN_QUALIFIER_ALIASES:
+        return function_name
+
+    addin_path = get_config().get("ACCESS_VCS_ADDIN_PATH")
+    if not addin_path:
+        return function_name
+
+    return f"{os.path.splitext(os.path.abspath(addin_path))[0]}.{member}"
+
+
+def _describe_run_failure(error: Exception, resolved_name: str, requested_name: str) -> str:
+    """Add context to an Application.Run failure where the raw COM error is unhelpful.
+
+    "Cannot find the procedure" is the one worth explaining: it usually means the
+    qualifier was a file name, and Application.Run matches loaded VBA project names.
+    """
+    text = f"VBA function call failed: {error}"
+
+    if "cannot find the procedure" not in str(error).lower():
+        return text
+
+    if resolved_name != requested_name:
+        text += f"\nResolved '{requested_name}' to '{resolved_name}'."
+
+    return text + (
+        "\nApplication.Run resolves the qualifier against a loaded VBA project name, "
+        'not a file name. To reach the VCS add-in, pass "VCS.API" as function_name; '
+        "it is rewritten to the add-in's full path, which also loads it on demand."
+    )
 
 
 @vcs_tool("vcs_run_vba")
@@ -1808,18 +2008,33 @@ def vcs_get_log(
     Read the most recent operation log file.
     
     Finds and returns the content of the most recent log file matching the
-    specified type (Export, Build, etc.) from the source folder's logs directory.
+    specified type, from the source folder's ``logs`` directory.
+    
+    **Pick the type that matches the operation you ran.** Each operation writes
+    its own log family, so asking for the wrong one silently returns a stale
+    log from a different run:
+    
+    - ``"Export"``  -- vcs_export_database, vcs_export_object
+    - ``"Merge"``   -- vcs_import_objects, vcs_import_object
+    - ``"Build"``   -- vcs_rebuild_database
+    - ``"TestRun"`` -- vcs_run_tests
+    - ``"Other"``   -- anything else
+    
+    Prefer the ``log_path`` returned by the operation itself; use this tool
+    when you no longer have it. These logs are gitignored, so Glob/Grep will
+    not find them.
     
     Examples:
         vcs_get_log("C:\\\\db.accdb")
-        vcs_get_log("C:\\\\db.accdb", log_type="Build")
+        vcs_get_log("C:\\\\db.accdb", log_type="Merge")
     
     Args:
         database_path: Path to Access database (.accdb, .accda, .mdb)
-        log_type: Type of log to read: "Export" (default) or "Build"
+        log_type: Log family to read: "Export" (default), "Merge", "Build",
+            "TestRun", or "Other"
     
     Returns:
-        Dictionary with log content, path, and success status
+        Dictionary with log content, log_path, and success status
     """
     try:
         db_path = validate_database_path(database_path)
@@ -1832,14 +2047,8 @@ def vcs_get_log(
             addin.load_addin(app, db_path=str(db_path))
             
             result_json = addin.call_sync("GetLogContent", log_type)
-            
-            if isinstance(result_json, str):
-                try:
-                    return json.loads(result_json)
-                except json.JSONDecodeError:
-                    return {"success": True, "content": result_json}
-            
-            return {"success": True, "result": result_json}
+
+            return _addin_json_result(result_json, raw_key="content")
     
     except Exception as e:
         return {"success": False, "error": str(e)}
