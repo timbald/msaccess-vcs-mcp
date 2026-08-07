@@ -74,6 +74,25 @@ contradictory guidance.
 
 ---
 
+## 2026-08-07 — Scoped object_types via ImportByType / ExportByType
+
+**Trigger**: `vcs_import_objects` and `vcs_export_database` accepted `object_types` but largely ignored them. Import always ran a full `MergeBuild`. Export only special-cased a modules-only list into `ExportVBA` and otherwise exported everything. Agents passed `object_types=["modules"]` expecting a partial merge and got a whole-project one with no warning. The documented `overwrite` flag on import never mapped to any add-in behavior.
+
+**Options explored**:
+- *Keep ignoring object_types / document the lie*: rejected. Agents already rely on the parameter.
+- *Add per-type MCP wrappers*: rejected. The add-in already exposes category-scoped APIs.
+- *Route to ImportByType / ExportByType via call_sync* (chosen): no add-in rebuild; `modAPI.API` reaches any public `clsVersionControl` method through `CallByName`.
+
+**Decision**: When `object_types` is set, call `ImportByType` / `ExportByType` synchronously and attach `log_path` like other sync results. When unset, keep the existing async full-project path (`MergeBuild` / `Export`/`FullExport`). Replace `overwrite` with `full_import`, which maps to `blnFullImport` (reload all files in the named categories vs only index-marked changes). Retire the modules-only `ExportVBA` shortcut so every scoped export uses one rule and reconciles deletions.
+
+Scoped calls are sync-only because those methods are not in `APIAsync`'s command list. That is acceptable for category-sized work; revisit by adding them to the async list if blocking becomes painful. Single-type lists are passed as a bare string to avoid COM array-marshalling edge cases; multi-type lists remain Python lists.
+
+**What this rules out**: Documenting or reintroducing an `overwrite` "skip existing" mode the add-in does not have. Treating a scoped merge as a safe partial without stating orphan deletion and no backup. Preferring `ExportVBA` for modules-only from these tools. Mapping "every category + full_import=True" as the recommended full rebuild path — use `vcs_rebuild_database` instead.
+
+**Relevant files**: `src/msaccess_vcs_mcp/tools.py` (`vcs_import_objects`, `vcs_export_database`, `_scoped_types_arg`); add-in `clsVersionControl.ExportByType` / `ImportByType`, `modBuild.MergeScoped`.
+
+---
+
 ## 2026-07-30 — Reaching the add-in API from MCP: vcs_call_vba, not vcs_run_vba
 
 **Trigger**: An agent spent a long session trying to run the add-in's round-trip test harness (`VCS.RunRoundtripTests`) through `vcs_run_vba`. Every attempt returned an empty string. That looked like a broken add-in, then a stuck Access instance, and the workaround attempted next (`HandleRibbonCommand`) corrupted the host VBA project with error 2517 and required closing and reopening the database. The session ended by telling the user to paste a command into the Immediate window — for a capability the tools already had.

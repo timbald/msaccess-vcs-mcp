@@ -190,13 +190,15 @@ The server prints diagnostics to stderr at startup (visible in Cursor's MCP serv
 
 Export Access database objects to source files via the VCS add-in.
 
-Supports all Access object types: tables, queries, forms, reports, modules, macros, and more. Uses fast save by default (only exports changed objects). Long-running exports report progress via async callbacks.
+With no `object_types`, exports the whole project (async progress). With
+`object_types`, exports only those categories via a scoped sync call. Uses
+fast save by default (only changed objects).
 
 **Args:**
 - `database_path`: Path to Access database (.accdb, .accda, .mdb)
 - `output_dir`: Directory to export source files to
-- `object_types`: Optional list of types (defaults to all types)
-- `full_export`: If True, export all objects (not just changed ones)
+- `object_types`: Optional list of categories (defaults to entire project)
+- `full_export`: If True, export all objects in scope (not just changed ones)
 
 **Returns:** `success`, `exported_count`, `export_path`, `objects_by_type`, `log_path`
 
@@ -234,20 +236,24 @@ Compare database objects against source files to see what has changed.
 vcs_diff_database("C:\\db.accdb", "C:\\src\\mydb")
 ```
 
-#### `vcs_import_objects(database_path, source_dir, object_types, overwrite)`
+#### `vcs_import_objects(database_path, source_dir, object_types, full_import)`
 
 Import objects from source files into Access database using merge build.
 
-Merges source file changes into the existing database without requiring a full rebuild. Requires write permission.
+With no `object_types`, runs a full project merge. With `object_types`, merges
+only those categories (orphan reconciliation within them; no database backup).
+Requires write permission.
 
 **Args:**
 - `database_path`: Path to Access database
 - `source_dir`: Directory containing source files
-- `object_types`: Optional list of types to import
-- `overwrite`: If True, overwrite existing objects
+- `object_types`: Optional list of categories to merge (e.g. `["queries"]`)
+- `full_import`: When scoped: if True, merge all source files in those
+  categories (ignore change index); if False (default), only changed files
 
 ```python
 vcs_import_objects("C:\\db.accdb", "C:\\src\\mydb")
+vcs_import_objects("C:\\db.accdb", "C:\\src\\mydb", object_types=["modules"], full_import=True)
 ```
 
 #### `vcs_rebuild_database(source_dir, output_path, template_path)`

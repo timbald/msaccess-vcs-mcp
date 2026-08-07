@@ -160,7 +160,9 @@ def _attach_log_context(
     and an agent told only that "the build failed" cannot search its way to the
     reason. Returning the tail inline on failure removes that dead end.
     """
-    log_path = (completion or {}).get("log_path")
+    # Prefer an explicit path from the completion callback or an already-
+    # normalized tool result (e.g. sync ImportByType / ExportByType JSON).
+    log_path = (completion or {}).get("log_path") or result.get("log_path")
     if not log_path or not os.path.exists(log_path):
         # The operation just ran, so the newest log for this family is its own.
         log_path = _newest_log(source_dir, base_name)
@@ -171,6 +173,20 @@ def _attach_log_context(
         if excerpt:
             result["log_excerpt"] = excerpt
     return result
+
+
+def _scoped_types_arg(object_types: list[str]) -> str | list[str]:
+    """
+    Shape ``object_types`` for ``ExportByType`` / ``ImportByType``.
+
+    The add-in accepts a single alias string or an array. A one-element list
+    is sent as a bare string so COM marshalling does not depend on
+    ``VT_ARRAY|VT_VARIANT`` for the common single-category case.
+    """
+    cleaned = [t.strip() for t in object_types if t and t.strip()]
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return cleaned
 
 
 def _get_operation_manager():
@@ -251,11 +267,12 @@ mcp = FastMCP(
         "- vcs_get_version_info() — server, add-in, and Access version info\n"
         "- vcs_list_objects(database_path*) — list all objects by type\n"
         "- vcs_export_database(database_path*, output_dir*, object_types?, full_export?) "
-        "— export all objects to source files\n"
+        "— export project (or scoped categories via object_types) to source files\n"
         "- vcs_export_object(database_path*, object_type*, object_name?) "
         "— export a single object/type to source\n"
-        "- vcs_import_objects(database_path*, source_dir*, object_types?, overwrite?) "
-        "— import/merge source files into database\n"
+        "- vcs_import_objects(database_path*, source_dir*, object_types?, full_import?) "
+        "— merge project (or scoped categories via object_types) from source; "
+        "scoped merges reconcile deletions and take no backup\n"
         "- vcs_import_object(database_path*, object_type*, object_name?) "
         "— import a single object/type from source\n"
         "- vcs_rebuild_database(source_dir*, output_path*, template_path?) "
@@ -503,11 +520,15 @@ async def vcs_export_database(
     """
     Export Access database objects to source files.
     
-    Exports tables, queries, forms, reports, macros, and modules to 
+    Exports tables, queries, forms, reports, macros, and modules to
     text-based files suitable for version control.
     
-    This operation supports progress reporting - you'll receive updates
-    as objects are exported.
+    With no ``object_types``, runs a full-project export (``Export`` /
+    ``FullExport``) with progress callbacks. With ``object_types``, runs a
+    category-scoped export via ``ExportByType`` — only those categories are
+    written, deletions within them are reconciled, and the call is
+    synchronous (no progress reporting). Prefer ``vcs_export_object`` for a
+    single named object.
     
     Examples:
         # Export entire database (quick/fast save - only changed objects)
@@ -526,10 +547,10 @@ async def vcs_export_database(
     Args:
         database_path: Path to Access database (.accdb, .accda, .mdb)
         output_dir: Directory to export source files to
-        object_types: Optional list of types to export: 
-            ["tables", "queries", "forms", "reports", "modules", "macros"]
-            If None, exports all types
-        full_export: If True, export all objects; if False (default), only export changed objects
+        object_types: Optional categories to export (e.g. ``["queries"]``,
+            ``["modules", "forms"]``). If None, exports the entire project.
+        full_export: If True, export all objects in scope; if False (default),
+            only export changed objects (per the VCS index)
     
     Returns:
         Dictionary with:
@@ -558,14 +579,8 @@ async def vcs_export_database(
         if busy_error:
             return busy_error
         
-        # Determine export command
-        vba_only = object_types and set(t.lower().strip() for t in object_types) <= {"module", "modules"}
-        if vba_only:
-            command = "ExportVBA"
-        elif full_export:
-            command = "FullExport"
-        else:
-            command = "Export"
+        # Determine full-project export command (scoped path uses ExportByType)
+        command = "FullExport" if full_export else "Export"
         
         # Connect to database
         with AccessConnection(str(db_path)) as conn:
@@ -587,6 +602,23 @@ async def vcs_export_database(
                     "objects_by_type": {},
                     "hint": "Check if Access has any open dialogs or message boxes"
                 }
+
+            # Category-scoped export: sync ExportByType (no progress callbacks).
+            if object_types:
+                types_arg = _scoped_types_arg(object_types)
+                if not types_arg:
+                    return {
+                        "success": False,
+                        "error": "object_types was empty after stripping blanks",
+                        "exported_count": 0,
+                        "export_path": str(export_path),
+                        "objects_by_type": {},
+                    }
+                result = _addin_json_result(
+                    addin.call_sync("ExportByType", types_arg, full_export)
+                )
+                result.setdefault("export_path", str(export_path))
+                return _attach_log_context(result, export_path, "Export")
             
             # Check if async export is available
             if callback_url and op_manager:
@@ -602,7 +634,7 @@ async def vcs_export_database(
                 )
                 
                 try:
-                    # Call async API (Export/ExportVBA don't take arguments - they use VCS options)
+                    # Call async API (Export/FullExport use VCS options)
                     async_result = addin.call_async(callback_info, command)
                     
                     completion = None
@@ -631,10 +663,7 @@ async def vcs_export_database(
                         # so run it synchronously rather than reporting success
                         # for work that never happened.
                         op_manager.unregister_operation(operation_id)
-                        if vba_only:
-                            result = addin.export_vba(str(db_path), str(export_path))
-                        else:
-                            result = addin.export_source(str(db_path), str(export_path))
+                        result = addin.export_source(str(db_path), str(export_path))
                         
                         if not result["success"]:
                             return _attach_log_context({
@@ -648,11 +677,7 @@ async def vcs_export_database(
                     # Async call failed - fall back to sync
                     completion = None
                     op_manager.unregister_operation(operation_id)
-                    # Perform sync export
-                    if vba_only:
-                        result = addin.export_vba(str(db_path), str(export_path))
-                    else:
-                        result = addin.export_source(str(db_path), str(export_path))
+                    result = addin.export_source(str(db_path), str(export_path))
                     
                     if not result["success"]:
                         return _attach_log_context({
@@ -665,10 +690,7 @@ async def vcs_export_database(
             else:
                 # Use sync path (no callbacks available)
                 completion = None
-                if vba_only:
-                    result = addin.export_vba(str(db_path), str(export_path))
-                else:
-                    result = addin.export_source(str(db_path), str(export_path))
+                result = addin.export_source(str(db_path), str(export_path))
                 
                 if not result["success"]:
                     return _attach_log_context({
@@ -863,35 +885,65 @@ async def vcs_import_objects(
     database_path: str,
     source_dir: str,
     object_types: list[str] | None = None,
-    overwrite: bool = False,
+    full_import: bool = False,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """
     Import objects from source files into Access database.
     
-    Merges source files back into database. Can update existing objects
-    or add new ones.
+    Merges source files back into the database. With no ``object_types``, runs
+    a full project merge (``MergeBuild``) with progress callbacks. With
+    ``object_types``, runs a category-scoped merge via ``ImportByType`` —
+    only those categories are touched.
     
-    This operation supports progress reporting - you'll receive updates
-    as objects are imported.
+    **Scoped import (when object_types is set):**
+    
+    - Database objects in the named categories with no corresponding source
+      file are **deleted** (orphan reconciliation).
+    - No database backup is taken (unlike a full ``MergeBuild``). Own your
+      backup before a destructive scoped merge.
+    - ``full_import=False`` (default) merges only files the VCS index marks
+      as changed. A stale or reset index can under-report; pass
+      ``full_import=True`` to reload every source file in those categories
+      regardless of the index. That path also skips conflict detection
+      (source wins for the named categories).
+    - Passing every category with ``full_import=True`` approximates a full
+      build without a backup — prefer ``vcs_rebuild_database`` there.
+    - Scoped calls are synchronous (no progress reporting). Prefer a single
+      object via ``vcs_import_object`` when you only need one name.
+    
+    ``source_dir`` must exist and is used for log resolution; the merge itself
+    reads from the project's configured export folder.
     
     Examples:
-        # Import all objects
-        vcs_import_objects("C:\\\\db.accdb", "C:\\\\src\\\\mydb", overwrite=True)
+        # Full project merge
+        vcs_import_objects("C:\\\\db.accdb", "C:\\\\src\\\\mydb")
         
-        # Import only queries
+        # Merge only queries (changed source files)
         vcs_import_objects(
             "C:\\\\db.accdb",
             "C:\\\\src\\\\mydb",
             object_types=["queries"],
-            overwrite=True
+        )
+        
+        # Reload every module from source, ignoring the change index
+        vcs_import_objects(
+            "C:\\\\db.accdb",
+            "C:\\\\src\\\\mydb",
+            object_types=["modules"],
+            full_import=True,
         )
     
     Args:
         database_path: Path to Access database
-        source_dir: Directory containing source files
-        object_types: Optional types to import (default: all)
-        overwrite: If True, replace existing objects; if False, skip
+        source_dir: Directory containing source files (must exist; merge uses
+            the project's export folder)
+        object_types: Optional categories to merge (e.g. ``["queries"]``,
+            ``["modules", "forms"]``). If None, merges the entire project.
+        full_import: When ``object_types`` is set: if False (default), merge
+            only changed source files; if True, merge all source files in
+            those categories (ignores the change index, skips conflict
+            prompts). Ignored for a full project merge.
     
     Returns:
         Dictionary with import results and any errors, plus ``log_path`` for
@@ -935,6 +987,24 @@ async def vcs_import_objects(
                     "imported_count": 0,
                     "hint": "Check if Access has any open dialogs or message boxes"
                 }
+
+            # Category-scoped merge: sync ImportByType (no progress callbacks).
+            if object_types:
+                types_arg = _scoped_types_arg(object_types)
+                if not types_arg:
+                    return {
+                        "success": False,
+                        "error": "object_types was empty after stripping blanks",
+                        "imported_count": 0,
+                    }
+                result = _addin_json_result(
+                    addin.call_sync("ImportByType", types_arg, full_import)
+                )
+                result.setdefault("database_path", str(db_path))
+                result.setdefault("source_dir", str(src_path))
+                if result.get("success") and "imported_count" not in result:
+                    result["imported_count"] = "See log for details"
+                return _attach_log_context(result, src_path, "Merge")
             
             # Check if async import is available
             if callback_url and op_manager:

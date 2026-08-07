@@ -214,6 +214,17 @@ class TestAttachLogContext:
 
         assert result["log_path"] == str(from_callback)
 
+    def test_result_log_path_wins_when_no_completion(self, tmp_path):
+        """Sync ImportByType / ExportByType put log_path on the result first."""
+        from_result = _write_log(tmp_path, "Merge_20260101_000000_000.log")
+        _write_log(tmp_path, "Merge_20260807_235959_999.log")
+
+        result = _attach_log_context(
+            {"success": True, "log_path": str(from_result)}, tmp_path, "Merge"
+        )
+
+        assert result["log_path"] == str(from_result)
+
     def test_falls_back_to_disk_when_callback_has_no_path(self, tmp_path):
         newest = _write_log(tmp_path, "Merge_20260807_235959_999.log")
 
