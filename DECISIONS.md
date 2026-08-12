@@ -89,14 +89,19 @@ the user's other databases).
   tool, and the status path is known from the source folder. No new MCP surface.
 
 **Decision**: Document the existing `vcs_call_vba` → `VCS.API` → `RebuildAddIn`
-path. The add-in writes `<source>/logs/rebuild-status.json` and refuses unless
-it is the only Access instance. A COM error after launch is expected.
+path. The add-in writes `<source>/logs/rebuild-status.json` and refuses when
+another Access instance holds a file the rebuild replaces. A COM error after
+launch is expected.
 `vcs_call_vba` still has no timeout; the worker sleeps before quit so the JSON
 can return. Adding a timeout remains a follow-up.
 
 **What this rules out**: Treating `vcs_rebuild_database` as the add-in rebuild
 path. Closing other Access windows from the MCP server. A dedicated rebuild-add-in
-tool unless `vcs_call_vba` grows a timeout.
+tool unless `vcs_call_vba` grows a timeout. Closing other Access windows from the
+MCP server stays out; the add-in reports the offenders instead, for reasons
+recorded in the add-in repo's own decision log. A second Access instance held by
+this server only blocks the rebuild if the add-in is loaded in it, which happens
+as soon as any `vcs_*` call routes through the add-in's API.
 
 **Relevant files**: `src/msaccess_vcs_mcp/tools.py` (instructions, `vcs_call_vba`
 example), `README.md`, `AGENTS.md`, `docs/AGENT_WORKFLOWS.md`.

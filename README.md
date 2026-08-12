@@ -285,7 +285,7 @@ result = vcs_call_vba(
 # Poll <source>/logs/rebuild-status.json until status is complete or *-failed/refused.
 ```
 
-The rebuild refuses unless this is the only Access instance in the Windows session. It never closes other Access windows. `vcs_call_vba` has no timeout; the worker sleeps before quitting so the JSON can return.
+The rebuild refuses when another `MSACCESS.EXE` in the Windows session holds one of the files it replaces — it checks the loaded VBA projects in each one, so an instance with an unrelated database open is left alone. An instance that cannot be asked also blocks it, because a busy instance rejects the automation calls that would answer and so looks identical to an idle one. It never closes another Access process. On refusal, `otherInstances` names each process, what was observed about it, and which file it holds, so you can close them deliberately. `vcs_call_vba` has no timeout; the worker sleeps before quitting so the JSON can return.
 
 ### Per-Object Operations
 

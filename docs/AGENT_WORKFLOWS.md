@@ -242,7 +242,7 @@ print(f"Built database contains {len(objects['queries'])} queries")
 
 This is **not** `vcs_rebuild_database`. That tool rebuilds a user project. The add-in rebuilds itself through `VCS.RebuildAddIn`.
 
-**Preconditions:** this Access process is the only `MSACCESS.EXE` in the Windows session; the repo folder is a trusted location; the helper script is enabled.
+**Preconditions:** no other `MSACCESS.EXE` in the Windows session may hold a file the rebuild replaces — the installed add-in or the build target. An instance with an unrelated database open does not block it; one that loaded the add-in does, as does one that cannot be asked. The guard reports them but closes nothing. The repo folder must be a trusted location and the helper script enabled.
 
 **Steps:**
 ```python
@@ -256,7 +256,7 @@ result = vcs_call_vba(
 ```
 
 **Tips:**
-- Close any other Access windows first; the rebuild refuses rather than killing them
+- A `refused` result lists each other process in `otherInstances` with what was observed about it; close those yourself and call again
 - `compile-failed` leaves Access open on the rebuilt file for Debug > Compile
 - After `complete`, later MCP calls load the newly installed add-in
 - `vcs_call_vba` has no timeout; the worker sleeps before quitting so the JSON can return

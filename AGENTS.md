@@ -100,7 +100,7 @@ To rebuild `Version Control.accda` from source after editing add-in files, do **
 vcs_call_vba(db, "VCS.API", ["RebuildAddIn", r"C:\Repos\msaccess-vcs-addin\Version Control.accda.src"])
 ```
 
-Read `statusFile` from the JSON. Access then exits (a COM error on that call is expected). Poll `<source>/logs/rebuild-status.json` with the Read tool until `status` is `complete` or `*-failed`/`refused`. The rebuild refuses unless this is the only Access instance; it never closes other windows. `vcs_call_vba` has no timeout — the worker sleeps before quitting so the JSON can return.
+Read `statusFile` from the JSON. Access then exits (a COM error on that call is expected). Poll `<source>/logs/rebuild-status.json` with the Read tool until `status` is `complete` or `*-failed`/`refused`. The rebuild refuses when another `MSACCESS.EXE` in the session holds a file it must replace, or cannot be asked which files it holds, and never closes another process; `otherInstances` in the refusal names what to close. `vcs_call_vba` has no timeout — the worker sleeps before quitting so the JSON can return.
 
 ## Logging
 
