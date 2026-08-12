@@ -39,7 +39,7 @@ from urllib.parse import unquote, urlparse
 
 from mcp.server.fastmcp import FastMCP, Context
 
-from .access_com.connection import AccessConnection
+from .access_com.connection import AccessConnection, ensure_access_visible
 from .access_com.dao_helpers import list_query_defs, list_table_defs
 from .config import (
     get_config,
@@ -261,12 +261,15 @@ mcp = FastMCP(
         "told apart from an idle one. On refusal, `otherInstances` names each process, what "
         "was observed about it, and which file it holds; close those and call again. "
         "This is not vcs_rebuild_database, which rebuilds a user project.\n"
-        "To run the add-in's OWN tests, pass the add-in path as database_path: its tests "
-        "only run when the add-in is the current database, since the runner scans the "
-        "current VBA project. Always run them through this server rather than from the "
-        "add-in's own window -- an all-EMPTY result (zero assertions) means the harness "
-        "was bypassed, not that the tests passed.\n"
         "Note: vcs_call_vba has no timeout; the worker sleeps before quitting so the JSON can return.\n\n"
+        "**Running the add-in's own tests:**\n"
+        "Pass the add-in path (`Version Control.accda`) as database_path. Its tests only "
+        "run when the add-in is the current database, since the runner scans the current "
+        "VBA project; pointing a run at a user database finds that database's tests "
+        "instead. This server opens the .accda as the current database for you, so no "
+        "manual pre-open step is needed. Always run these tests through this server "
+        "rather than from the add-in's own window -- an all-EMPTY result (zero "
+        "assertions) means the harness was bypassed, not that the tests passed.\n\n"
         "**VBA compile failures:**\n"
         "MCP compile tools return success/failure only — not the failing module or line. "
         "When vcs_compile_vba returns success=false (or vcs_check_vba_compiled shows "
@@ -1173,6 +1176,9 @@ async def vcs_rebuild_database(
         # database path) and manage its lifecycle with try/finally.
         from win32com.client import gencache
         app = gencache.EnsureDispatch("Access.Application")
+        # The build creates and populates a database in this instance, so any
+        # prompt it raises has to be visible to be answerable.
+        ensure_access_visible(app)
         
         try:
             addin = VCSAddinIntegration(config.get("ACCESS_VCS_ADDIN_PATH"))

@@ -79,6 +79,17 @@ AI Agent ──► MCP Server (Python) ──► VCS Add-in (VBA) ──► Acce
            Async progress tracking
 ```
 
+### Access window visibility
+
+Any Access instance holding a database the server works with is left **visible**, whether the server created it or attached to one already running. A hidden instance strands the user: an error dialog, a VBA break, or a trust prompt blocks every later call with nothing on screen to explain why, and nobody can dismiss what they cannot see. `COM automation` normally starts Access hidden, so this is deliberate, not incidental.
+
+Two rules follow from that, both enforced in `access_com/connection.py`:
+
+- Open databases through `open_current_database(app, path)`, never a bare `app.OpenCurrentDatabase(...)`. It lowers `Application.UserControl` across the open — `OpenCurrentDatabase` runs the target's AutoExec, and the add-in's own `AutoRun` opens its installer form when that flag says a person is watching, stranding the instance the server is about to drive — and it shows the window afterwards.
+- Show the window *after* the database opens, via `ensure_access_visible(app)`. Making a window visible can itself set `UserControl`, which is why the order is not interchangeable.
+
+The one deliberate exception is `validate_access_installation()` in `config.py`: it opens no database and quits immediately, so a window would only flash on screen with nothing to act on.
+
 ## Configuration
 
 All settings come from environment variables (loaded from `.env` / `.env.local` in the project root). See `.env.example` for the full list.
@@ -101,6 +112,18 @@ vcs_call_vba(db, "VCS.API", ["RebuildAddIn", r"C:\Repos\msaccess-vcs-addin\Versi
 ```
 
 Read `statusFile` from the JSON. Access then exits (a COM error on that call is expected). Poll `<source>/logs/rebuild-status.json` with the Read tool until `status` is `complete` or `*-failed`/`refused`. The rebuild refuses when another `MSACCESS.EXE` in the session holds a file it must replace, or cannot be asked which files it holds, and never closes another process; `otherInstances` in the refusal names what to close. `vcs_call_vba` has no timeout — the worker sleeps before quitting so the JSON can return.
+
+### Running the add-in's own tests
+
+Pass the add-in itself as `database_path`:
+
+```python
+vcs_run_tests(r"C:\Repos\msaccess-vcs-addin\Version Control.accda", "clsTestInstall")
+```
+
+The add-in's tests only run when the add-in is the current database, because the runner scans the current VBA project — aim a run at a user database and you get that database's tests. `AccessConnection` opens the `.accda` as the current database itself (Access refuses to bind a file moniker to an add-in, so `GetObject` fails and the explicit `OpenCurrentDatabase` fallback in `_open_as_current_database` takes over), so no manual pre-open is needed.
+
+Run these tests **through this server**, never from the add-in's own window. `modTestAssert.TestAssert` routes through `Application.Run` to the *installed* add-in path, while the runner singleton that records assertions lives in whichever project received `RunTests`. Invoking them from a development copy puts those in different projects: assertions are discarded and every test reports `EMPTY`. Treat an all-`EMPTY` result as a broken harness, not a pass.
 
 ## Logging
 

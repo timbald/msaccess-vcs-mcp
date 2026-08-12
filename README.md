@@ -32,6 +32,10 @@ AI Agent -> MCP Server (Python) -> VCS Add-in (VBA) -> Access Database
 
 All business logic lives in VBA. The MCP layer validates inputs, manages async lifecycle, and formats responses.
 
+### Access windows are visible
+
+When a tool needs Access, the window is shown rather than kept hidden — expect an Access window to appear if one isn't already open. This is intentional: Access asks questions that only a person can answer (trust prompts, "convert this database?", a VBA error breaking into the debugger), and an operation that stalls behind an invisible dialog looks like a hang with no way to clear it. The server never closes an Access window it did not open.
+
 ## Prerequisites
 
 - **Python**: 3.10 or higher
@@ -286,6 +290,18 @@ result = vcs_call_vba(
 ```
 
 The rebuild refuses when another `MSACCESS.EXE` in the Windows session holds one of the files it replaces — it checks the loaded VBA projects in each one, so an instance with an unrelated database open is left alone. An instance that cannot be asked also blocks it, because a busy instance rejects the automation calls that would answer and so looks identical to an idle one. It never closes another Access process. On refusal, `otherInstances` names each process, what was observed about it, and which file it holds, so you can close them deliberately. `vcs_call_vba` has no timeout; the worker sleeps before quitting so the JSON can return.
+
+#### Running the add-in's own tests
+
+Pass the add-in itself as the database path:
+
+```python
+vcs_run_tests(r"C:\Repos\msaccess-vcs-addin\Version Control.accda", filter="clsTestInstall")
+```
+
+The add-in's tests only run when the add-in is the current database, because the test runner scans the current VBA project — a run aimed at a user database finds that database's tests instead. The server opens the `.accda` as the current database for you, so there is no manual pre-open step.
+
+Run these tests through the server rather than from the add-in's own window. Assertions are recorded by the runner in whichever project received the call, while `TestAssert` always routes to the *installed* add-in, so a run started inside a development copy discards every assertion and reports `EMPTY` for each test. An all-`EMPTY` result means the harness was bypassed, not that the tests passed.
 
 ### Per-Object Operations
 

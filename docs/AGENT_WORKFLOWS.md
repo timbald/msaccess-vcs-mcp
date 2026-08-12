@@ -261,6 +261,22 @@ result = vcs_call_vba(
 - After `complete`, later MCP calls load the newly installed add-in
 - `vcs_call_vba` has no timeout; the worker sleeps before quitting so the JSON can return
 
+### 6c. Run the add-in's own test suite
+
+**Use case:** You changed add-in source and want its own tests to confirm the rebuild before touching a user database.
+
+**Steps:**
+```python
+vcs_run_tests(r"C:\Repos\msaccess-vcs-addin\Version Control.accda", filter="clsTestInstall")
+```
+
+**Why the path is the add-in itself:** the test runner scans the current VBA project, so the add-in's tests only run when the add-in is the current database. Aim the call at a user database and you get that database's tests. Access will not bind a file moniker to an `.accda`, so the server opens it as the current database explicitly — you do not need to open it first.
+
+**Tips:**
+- Run through the MCP server, not from the add-in's own window; assertions route to the installed add-in while the runner lives in the calling project, so a development-copy run discards them all
+- An all-`EMPTY` result (zero assertions) is a bypassed harness, not a pass
+- A rebuild ends with no Access process running, so expect a cold start on the next call
+
 ### 7. Iterative Development Cycle
 
 **Use case:** Rapid development with frequent testing

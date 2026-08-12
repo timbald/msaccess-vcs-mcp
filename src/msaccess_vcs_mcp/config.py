@@ -488,6 +488,9 @@ def validate_access_installation() -> None:
     try:
         # This will fail if Access is not installed
         # Use EnsureDispatch for early binding (fixes Application.Run issues)
+        # Deliberately left hidden, unlike instances that hold a database: no
+        # database is opened here and the instance is quit immediately, so a
+        # window would only flash on screen with nothing to act on.
         app = gencache.EnsureDispatch("Access.Application")
         
         # Check if this is the user's instance (has a database open)

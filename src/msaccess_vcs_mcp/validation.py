@@ -11,6 +11,7 @@ import os
 from typing import Any
 
 from . import __version__
+from .access_com.connection import ensure_access_visible, open_current_database
 from .addin_integration import VCSAddinIntegration, get_access_info
 from .config import get_config
 
@@ -124,6 +125,10 @@ def validate_components(load_addin: bool = True) -> dict[str, Any]:
                 app = win32com.client.GetObject(target_db)
                 owns_app = False  # User's Access instance - don't close it
                 db_was_already_open = True
+                # Moniker binding launches Access hidden when nothing had the
+                # file open, and the add-in probe below can raise a trust
+                # prompt that only a visible window lets anyone answer.
+                ensure_access_visible(app)
                 
                 # Verify it's actually the target database (safety check)
                 try:
@@ -202,7 +207,7 @@ def validate_components(load_addin: bool = True) -> dict[str, Any]:
                                 # Database is open but it's a different one
                                 # Only open target if we own the app
                                 if owns_app:
-                                    app.OpenCurrentDatabase(target_db)
+                                    open_current_database(app, target_db)
                                     db_was_already_open = False  # We opened it now
                                 else:
                                     # Can't change user's database, skip version check
@@ -214,7 +219,7 @@ def validate_components(load_addin: bool = True) -> dict[str, Any]:
                     except Exception:
                         # Can't verify current database, try to open target if we own app
                         if owns_app:
-                            app.OpenCurrentDatabase(target_db)
+                            open_current_database(app, target_db)
                             db_was_already_open = False
                         else:
                             result["warnings"].append(
@@ -223,7 +228,7 @@ def validate_components(load_addin: bool = True) -> dict[str, Any]:
                             return result
                 else:
                     # Database wasn't already open, open it now
-                    app.OpenCurrentDatabase(target_db)
+                    open_current_database(app, target_db)
                 
                 # Final verification: ensure we're working with the correct database
                 try:

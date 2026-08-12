@@ -14,6 +14,7 @@ try:
 except ImportError:
     COM_AVAILABLE = False
 
+from .access_com.connection import ensure_access_visible
 from .addin_integration import VCSAddinIntegration
 from .com_recovery import (
     classify_com_error,
@@ -326,6 +327,9 @@ class VBAWorkerManager:
                             f"from worker thread. The Access application "
                             f"may have been closed."
                         )
+                    # Submitted code can break into the VBE or raise a dialog;
+                    # both are only recoverable in a window someone can see.
+                    ensure_access_visible(worker_app)
 
                     phase = "load_addin"
                     addin = VCSAddinIntegration(addin_path)

@@ -31,6 +31,67 @@ def _paths_match(a: str, b: str) -> bool:
         return False
 
 
+def ensure_access_visible(app) -> bool:
+    """Show the Access window for any instance we drive a database through.
+
+    A hidden instance strands the user: an error dialog, a VBA break, or a
+    trust prompt blocks every later call with nothing on screen to explain
+    why, and nobody can dismiss what they cannot see.  Visibility is
+    therefore not optional for database work -- it applies to instances we
+    created and to ones we attached to, since either can raise a dialog.
+
+    Call this *after* the database is open.  Making the window visible can
+    set ``UserControl``, and startup code reads that flag to decide whether
+    a person is watching (see ``open_current_database``).
+
+    Best-effort by design: failing to show the window is never worth failing
+    an operation over.
+    """
+    try:
+        app.Visible = True
+        return True
+    except Exception as e:
+        print(f"Could not make Access visible: {e}", file=sys.stderr)
+        return False
+
+
+def open_current_database(app, db_path: str) -> None:
+    """Open ``db_path`` as ``app``'s current database, as automation.
+
+    ``OpenCurrentDatabase`` runs the target's AutoExec.  Startup code
+    commonly branches on ``Application.UserControl`` to decide whether a
+    person is watching -- the VCS add-in's own ``AutoRun`` opens its
+    installer form when it believes one is, which strands the instance we
+    are about to automate.  The flag gets set both deliberately (see
+    ``AccessConnection._create_isolated_instance``, which needs the process
+    to outlive a client teardown) and as a side effect of making the window
+    visible, so lower it across the open and restore it afterwards.
+
+    Use this in place of a bare ``OpenCurrentDatabase`` call: it also leaves
+    the instance visible, which is the invariant every database-holding
+    instance owes the user.
+    """
+    try:
+        was_set = bool(app.UserControl)
+    except Exception:
+        was_set = False
+
+    if was_set:
+        try:
+            app.UserControl = False
+        except Exception:
+            was_set = False
+    try:
+        app.OpenCurrentDatabase(db_path)
+    finally:
+        if was_set:
+            try:
+                app.UserControl = True
+            except Exception:
+                pass
+    ensure_access_visible(app)
+
+
 class AccessConnection:
     """
     Manages COM connection to Access database.
@@ -83,6 +144,11 @@ class AccessConnection:
         The ownership check after EnsureDispatch prevents the dangerous
         scenario where close() calls Quit() on the user's Access window
         (ported from db-inspector-mcp's DispatchEx fallback pattern).
+
+        Whichever route wins, the instance ends up visible: a dialog or a
+        VBA break in a hidden window is unresolvable by the person who has
+        to resolve it.  That happens last, once the database is open, for
+        the ``UserControl`` reason in ``open_current_database``.
         """
         if self._app is None:
             try:
@@ -93,6 +159,7 @@ class AccessConnection:
                 self._app = self._create_or_reuse_instance()
                 self._db_opened_via_getobject = False
                 self._open_as_current_database(self._app)
+            ensure_access_visible(self._app)
         return self._app
 
     def _open_as_current_database(self, app):
@@ -105,6 +172,11 @@ class AccessConnection:
         fallback the instance has no current database, so add-in calls and
         the Running Object Table lookup in ``_find_access_in_rot`` (which
         matches on ``CurrentDb().Name``) both come up empty.
+
+        A failed open is not fatal: leaving ``_db_opened_as_current`` False
+        lets ``_get_current_db`` fall through to its DAO strategies, which
+        still serve read-only callers when Access itself cannot take the
+        file as the current database.
         """
         try:
             existing = app.CurrentDb()
@@ -121,8 +193,15 @@ class AccessConnection:
             if not self._owns_app:
                 return
 
-        app.OpenCurrentDatabase(self._db_path)
-        self._db_opened_as_current = True
+        try:
+            open_current_database(app, self._db_path)
+            self._db_opened_as_current = True
+        except Exception as e:
+            print(
+                f"[{os.path.basename(self._db_path)}] OpenCurrentDatabase "
+                f"failed ({e}) -- falling back to DAO",
+                file=sys.stderr,
+            )
 
     def _create_or_reuse_instance(self):
         """Create or attach to an Access instance with correct ownership.
@@ -159,7 +238,10 @@ class AccessConnection:
         """Create a guaranteed-isolated Access process via DispatchEx.
 
         Unlike EnsureDispatch, DispatchEx always spawns a new COM server
-        process independent of any existing Access instance.
+        process independent of any existing Access instance.  ``UserControl``
+        keeps that process alive if the client goes away mid-operation; see
+        ``open_current_database`` for why it has to be lowered again while a
+        database opens.
         """
         app = win32com.client.DispatchEx("Access.Application")
         app.UserControl = True

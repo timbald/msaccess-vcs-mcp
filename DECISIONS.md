@@ -74,6 +74,94 @@ contradictory guidance.
 
 ---
 
+## 2026-08-12 — Access instances holding a database stay visible
+
+**Trigger**: COM automation starts Access hidden, and nothing in the server
+ever showed the window. Access still asks questions only a person can answer —
+trust prompts, conversion prompts, a VBA error breaking into the debugger — and
+behind an invisible window those look like a hang. Every later call then blocks
+on an instance the user cannot see, may not know exists, and has no way to
+clear. The `.accda` work made this sharper by opening databases in instances
+the server creates itself.
+
+**Options explored**:
+- *Leave instances hidden and detect the stall instead.* Rejected. The probe
+  timeouts already report "Access is likely in break mode or blocked on a modal
+  dialog", which is the right diagnosis and still leaves the user with no
+  window to act on. Detection is not recovery.
+- *Show only instances the server creates.* Rejected. An attached instance can
+  raise the same dialog, and moniker binding launches a hidden Access when
+  nothing had the file open, so "attached" does not imply "a person can see
+  it".
+- *Make visibility configurable.* Deferred. An opt-out re-creates the
+  unresolvable-dialog failure for whoever sets it; wait for a concrete need
+  (unattended CI is the plausible one).
+
+**Decision**: Any instance the server drives a database through ends up
+visible. Two helpers in `access_com/connection.py` carry the rule so it cannot
+be half-applied: `ensure_access_visible(app)` (best-effort, never fails an
+operation) and `open_current_database(app, path)`, which replaces every bare
+`app.OpenCurrentDatabase(...)` call. Visibility comes *after* the open, because
+showing a window can set `UserControl` and the add-in's `AutoRun` reads that
+flag to decide whether a person is watching. `validate_access_installation()`
+is the one exception: no database, quit immediately, so a window would only
+flash.
+
+**What this rules out**: Bare `OpenCurrentDatabase` calls — the AutoExec and
+visibility rules travel with the helper, and a new call site that skips it
+silently loses both. Hiding instances for speed or tidiness. Treating a probe
+timeout as sufficient handling for a blocked dialog.
+
+**Relevant files**: `src/msaccess_vcs_mcp/access_com/connection.py`
+(`ensure_access_visible`, `open_current_database`), `validation.py`,
+`vba_worker_manager.py`, `tools.py` (`vcs_rebuild_database`), `config.py`,
+`tests/test_access_visibility.py`.
+
+---
+
+## 2026-08-12 — Opening .accda as the current database for add-in self-tests
+
+**Trigger**: The add-in's own tests only run when the add-in is the current
+database, because the runner walks `CurrentVBProject`. Every `vcs_run_tests`
+call against `Version Control.accda` failed with "Cannot find Access instance".
+`GetObject(path)` binds a file moniker that resolves through the COM
+registration for the extension; that registration opens .accdb and .mdb as the
+current database but treats .accda as an add-in, so the bind fails. The
+fallback instance then had no current database, and tier 2 of
+`_find_access_in_rot` matches on `CurrentDb().Name`, so nothing was found.
+
+**Options explored**:
+- *Have a person pre-open the file* (the PowerShell `OpenCurrentDatabase`
+  recipe in the add-in repo's `docs/agentic-rebuild.md`). Rejected: a human
+  step per iteration, which is what this whole path exists to remove. That
+  section of the add-in docs is stale as of this entry.
+- *Register a file moniker for .accda.* Rejected: machine-wide COM
+  registration change to fix one client.
+- *Call `OpenCurrentDatabase` when the moniker bind fails* (chosen). Same
+  approach `validation.py` already takes, and no new configuration.
+
+**Decision**: `_open_as_current_database` runs only on the GetObject-failure
+branch, and opens only on an instance we own, so a user's database is never
+displaced. Two constraints surfaced in review. `UserControl` is lowered across
+the open: `OpenCurrentDatabase` runs the target's AutoExec, and the add-in's
+`AutoRun` opens its installer form when `Application.UserControl` says a person
+is watching — which would strand the instance we are about to automate, and did
+so whenever `_create_isolated_instance` supplied the process. A failed open is
+also swallowed rather than raised, so `_get_current_db` can still reach its DAO
+strategies for read-only callers.
+
+**What this rules out**: Documenting a manual pre-open step for add-in tests.
+Setting `UserControl` before a database opens — `_create_isolated_instance`
+still needs it for teardown survival, so it has to be restored after AutoExec,
+not before. Letting an `OpenCurrentDatabase` failure escape `_get_access_app`,
+which would bypass the DAO fallback chain that predates this path.
+
+**Relevant files**: `src/msaccess_vcs_mcp/access_com/connection.py`
+(`_open_as_current_database`, `open_current_database`),
+`tests/test_accda_current_database.py`.
+
+---
+
 ## 2026-08-12 — Agentic add-in rebuild via existing vcs_call_vba
 
 **Trigger**: Agents iterating on the VCS add-in source could not rebuild
@@ -96,12 +184,12 @@ launch is expected.
 can return. Adding a timeout remains a follow-up.
 
 **What this rules out**: Treating `vcs_rebuild_database` as the add-in rebuild
-path. Closing other Access windows from the MCP server. A dedicated rebuild-add-in
-tool unless `vcs_call_vba` grows a timeout. Closing other Access windows from the
-MCP server stays out; the add-in reports the offenders instead, for reasons
-recorded in the add-in repo's own decision log. A second Access instance held by
-this server only blocks the rebuild if the add-in is loaded in it, which happens
-as soon as any `vcs_*` call routes through the add-in's API.
+path. A dedicated rebuild-add-in tool unless `vcs_call_vba` grows a timeout.
+Closing other Access windows from the MCP server stays out; the add-in reports
+the offenders instead, for reasons recorded in the add-in repo's own decision
+log. A second Access instance held by this server only blocks the rebuild if the
+add-in is loaded in it, which happens as soon as any `vcs_*` call routes through
+the add-in's API.
 
 **Relevant files**: `src/msaccess_vcs_mcp/tools.py` (instructions, `vcs_call_vba`
 example), `README.md`, `AGENTS.md`, `docs/AGENT_WORKFLOWS.md`.

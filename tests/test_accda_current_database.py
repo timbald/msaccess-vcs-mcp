@@ -110,6 +110,54 @@ class TestAccdaOpensAsCurrentDatabase:
         app.DBEngine.OpenDatabase.assert_not_called()
         assert c._owns_db is False
 
+    def test_autoexec_sees_automation_during_the_open(self):
+        """UserControl must be down while AutoExec runs, and back up after.
+
+        ``_create_isolated_instance`` sets the flag so Access survives client
+        teardown, but the add-in's ``AutoRun`` reads it to decide whether a
+        person is watching and opens its installer form if one is.
+        """
+        app = _app_with_current_db(None)
+        app.UserControl = True
+        observed = []
+        app.OpenCurrentDatabase.side_effect = lambda _p: observed.append(app.UserControl)
+
+        c = AccessConnection(ACCDA)
+        c._owns_app = True
+        c._open_as_current_database(app)
+
+        assert observed == [False]
+        assert app.UserControl is True
+
+    def test_user_control_left_alone_when_never_set(self):
+        """An EnsureDispatch instance already looks like automation."""
+        app = _app_with_current_db(None)
+        app.UserControl = False
+
+        c = AccessConnection(ACCDA)
+        c._owns_app = True
+        c._open_as_current_database(app)
+
+        assert app.UserControl is False
+
+    def test_failed_open_leaves_the_dao_fallback_reachable(self):
+        """A refused open must not escape and strand read-only callers."""
+        app = _app_with_current_db(None)
+        app.UserControl = False
+        app.OpenCurrentDatabase.side_effect = Exception("file already in use")
+
+        c = AccessConnection(ACCDA)
+        c._owns_app = True
+        c._open_as_current_database(app)
+
+        assert c._db_opened_as_current is False
+
+        c._app = app
+        db = c._get_current_db()
+
+        assert db is app.DBEngine.OpenDatabase.return_value
+        assert c._owns_db is True
+
     def test_close_resets_the_flag(self):
         app = _app_with_current_db(ACCDA)
 
