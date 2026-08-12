@@ -249,13 +249,15 @@ mcp = FastMCP(
         "Set ACCESS_VCS_DATABASE to your target database path.\n"
         "Set ACCESS_VCS_DISABLE_WRITES=true to prevent database modifications.\n\n"
         "**Rebuilding the VCS add-in:**\n"
-        "The VCS add-in (`Version Control.accda`) itself cannot be rebuilt via MCP tools. "
-        "Rebuilding it requires all Access instances to be closed, which would also close "
-        "any database files the user currently has open. If you change add-in source files "
-        "(e.g. `clsQueryComposer.cls`), ask the user to rebuild the add-in manually -- they "
-        "must close every open Access window first, then run the add-in's own build "
-        "process. After the user confirms the rebuild is complete, you can re-run "
-        "verification steps (export/import/rebuild of target databases) through the MCP.\n\n"
+        "To rebuild `Version Control.accda` from source after editing add-in files, "
+        "call vcs_call_vba(db, \"VCS.API\", [\"RebuildAddIn\", \"<source folder>\"]). "
+        "Read `statusFile` from the JSON result. The Access instance then exits "
+        "(a COM error on that call is expected). Poll `<source folder>/logs/rebuild-status.json` "
+        "with the Read tool until status is `complete` or `*-failed`/`refused`. "
+        "The rebuild refuses unless this is the only Access instance in the Windows session; "
+        "it never closes other people's Access windows. "
+        "This is not vcs_rebuild_database, which rebuilds a user project.\n"
+        "Note: vcs_call_vba has no timeout; the worker sleeps before quitting so the JSON can return.\n\n"
         "**VBA compile failures:**\n"
         "MCP compile tools return success/failure only — not the failing module or line. "
         "When vcs_compile_vba returns success=false (or vcs_check_vba_compiled shows "
@@ -1737,6 +1739,7 @@ def vcs_call_vba(
         vcs_call_vba("C:\\\\db.accdb", "MyModule.GetQuerySQL", ["qryCustomers"])
         vcs_call_vba("C:\\\\db.accdb", "VCS.API", ["GetVCSVersion"])
         vcs_call_vba("C:\\\\db.accdb", "VCS.API", ["RunRoundtripTests", "C:\\\\fixtures\\\\"])
+        vcs_call_vba("C:\\\\db.accdb", "VCS.API", ["RebuildAddIn", "C:\\\\Repos\\\\msaccess-vcs-addin\\\\Version Control.accda.src\\\\"])
 
     Args:
         database_path: Path to Access database (.accdb, .accda, .mdb)

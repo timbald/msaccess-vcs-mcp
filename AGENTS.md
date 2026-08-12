@@ -92,6 +92,16 @@ Key variables:
 
 `vcs_run_vba` executes Access COM work in a short-lived child Python process. If a snippet hangs because Access is in break mode, blocked on a modal dialog, or otherwise unresponsive, the MCP server kills only that child process and returns a recoverable timeout. It does **not** kill `MSACCESS.EXE` or close user-owned Access windows; after Access becomes responsive, the next call runs an automatic probe and resumes normal operation.
 
+### Rebuilding the VCS add-in
+
+To rebuild `Version Control.accda` from source after editing add-in files, do **not** use `vcs_rebuild_database` (that rebuilds a user project). Call:
+
+```python
+vcs_call_vba(db, "VCS.API", ["RebuildAddIn", r"C:\Repos\msaccess-vcs-addin\Version Control.accda.src"])
+```
+
+Read `statusFile` from the JSON. Access then exits (a COM error on that call is expected). Poll `<source>/logs/rebuild-status.json` with the Read tool until `status` is `complete` or `*-failed`/`refused`. The rebuild refuses unless this is the only Access instance; it never closes other windows. `vcs_call_vba` has no timeout — the worker sleeps before quitting so the JSON can return.
+
 ## Logging
 
 The server writes two parallel JSON Lines streams. Both filenames use the `vcs-mcp-` prefix so they don't collide with other tools that share the same logs directory.

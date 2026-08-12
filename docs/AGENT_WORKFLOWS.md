@@ -236,6 +236,31 @@ print(f"Built database contains {len(objects['queries'])} queries")
 - Review Build.log for any issues
 - Test thoroughly before distributing
 
+### 6b. Rebuild the VCS add-in from source
+
+**Use case:** You edited add-in source (for example `clsQueryComposer.cls`) and need the running add-in to pick up those changes without waiting for a person.
+
+This is **not** `vcs_rebuild_database`. That tool rebuilds a user project. The add-in rebuilds itself through `VCS.RebuildAddIn`.
+
+**Preconditions:** this Access process is the only `MSACCESS.EXE` in the Windows session; the repo folder is a trusted location; the helper script is enabled.
+
+**Steps:**
+```python
+result = vcs_call_vba(
+    db_path,
+    "VCS.API",
+    ["RebuildAddIn", r"C:\Repos\msaccess-vcs-addin\Version Control.accda.src"],
+)
+# Parse result["result"] for statusFile. Access then quits; a COM error is expected.
+# Poll <source>/logs/rebuild-status.json until status is complete or *-failed/refused.
+```
+
+**Tips:**
+- Close any other Access windows first; the rebuild refuses rather than killing them
+- `compile-failed` leaves Access open on the rebuilt file for Debug > Compile
+- After `complete`, later MCP calls load the newly installed add-in
+- `vcs_call_vba` has no timeout; the worker sleeps before quitting so the JSON can return
+
 ### 7. Iterative Development Cycle
 
 **Use case:** Rapid development with frequent testing

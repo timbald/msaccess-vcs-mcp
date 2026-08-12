@@ -271,6 +271,22 @@ Creates a fresh database from source files, useful for clean builds and distribu
 vcs_rebuild_database("C:\\src\\mydb", "C:\\output\\fresh.accdb")
 ```
 
+#### Rebuilding the VCS add-in itself
+
+`vcs_rebuild_database` rebuilds a *user* project. To rebuild `Version Control.accda` from `Version Control.accda.src` after editing add-in source:
+
+```python
+result = vcs_call_vba(
+    r"C:\path\to\Testing.accdb",
+    "VCS.API",
+    ["RebuildAddIn", r"C:\Repos\msaccess-vcs-addin\Version Control.accda.src"],
+)
+# result["result"] is JSON with statusFile. Access then exits (a COM error is expected).
+# Poll <source>/logs/rebuild-status.json until status is complete or *-failed/refused.
+```
+
+The rebuild refuses unless this is the only Access instance in the Windows session. It never closes other Access windows. `vcs_call_vba` has no timeout; the worker sleeps before quitting so the JSON can return.
+
 ### Per-Object Operations
 
 #### `vcs_export_object(database_path, object_type, object_name)`

@@ -74,6 +74,35 @@ contradictory guidance.
 
 ---
 
+## 2026-08-12 — Agentic add-in rebuild via existing vcs_call_vba
+
+**Trigger**: Agents iterating on the VCS add-in source could not rebuild
+`Version Control.accda` without a person, because server instructions told them
+the add-in cannot be rebuilt via MCP (closing every Access instance would close
+the user's other databases).
+
+**Options explored**:
+- *New `vcs_rebuild_addin` tool that waits on COM.* Rejected. The Access instance
+  the MCP is talking to is deliberately quit; a blocking COM wait would hang.
+  `vcs_call_vba` already dispatches `RebuildAddIn` through `CallByName`.
+- *Have the server poll the status file.* Rejected. The agent already has a Read
+  tool, and the status path is known from the source folder. No new MCP surface.
+
+**Decision**: Document the existing `vcs_call_vba` → `VCS.API` → `RebuildAddIn`
+path. The add-in writes `<source>/logs/rebuild-status.json` and refuses unless
+it is the only Access instance. A COM error after launch is expected.
+`vcs_call_vba` still has no timeout; the worker sleeps before quit so the JSON
+can return. Adding a timeout remains a follow-up.
+
+**What this rules out**: Treating `vcs_rebuild_database` as the add-in rebuild
+path. Closing other Access windows from the MCP server. A dedicated rebuild-add-in
+tool unless `vcs_call_vba` grows a timeout.
+
+**Relevant files**: `src/msaccess_vcs_mcp/tools.py` (instructions, `vcs_call_vba`
+example), `README.md`, `AGENTS.md`, `docs/AGENT_WORKFLOWS.md`.
+
+---
+
 ## 2026-08-07 — Scoped object_types via ImportByType / ExportByType
 
 **Trigger**: `vcs_import_objects` and `vcs_export_database` accepted `object_types` but largely ignored them. Import always ran a full `MergeBuild`. Export only special-cased a modules-only list into `ExportVBA` and otherwise exported everything. Agents passed `object_types=["modules"]` expecting a partial merge and got a whole-project one with no warning. The documented `overwrite` flag on import never mapped to any add-in behavior.
