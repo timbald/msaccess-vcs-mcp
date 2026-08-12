@@ -61,6 +61,7 @@ class AccessConnection:
         self._owns_app = False  # True only if we created Access via Dispatch
         self._owns_db = False   # True only if we opened db via DBEngine
         self._db_opened_via_getobject = False  # True if connected to existing instance
+        self._db_opened_as_current = False  # True if we called OpenCurrentDatabase
     
     def _get_access_app(self):
         """
@@ -91,7 +92,37 @@ class AccessConnection:
             except Exception:
                 self._app = self._create_or_reuse_instance()
                 self._db_opened_via_getobject = False
+                self._open_as_current_database(self._app)
         return self._app
+
+    def _open_as_current_database(self, app):
+        """Make ``self._db_path`` the instance's current database.
+
+        ``GetObject(path)`` binds a file moniker, which resolves through the
+        COM registration for the file's extension.  That registration opens
+        .accdb and .mdb as the current database, but not .accda -- Access
+        treats it as an add-in and moniker binding fails.  Without this
+        fallback the instance has no current database, so add-in calls and
+        the Running Object Table lookup in ``_find_access_in_rot`` (which
+        matches on ``CurrentDb().Name``) both come up empty.
+        """
+        try:
+            existing = app.CurrentDb()
+        except Exception:
+            existing = None
+
+        if existing is not None:
+            if _paths_match(existing.Name, self._db_path):
+                self._db_opened_as_current = True
+                return
+            # A different database is open.  _create_or_reuse_instance
+            # routes that case to an isolated process, so this only happens
+            # on an instance we own; never displace a user's database.
+            if not self._owns_app:
+                return
+
+        app.OpenCurrentDatabase(self._db_path)
+        self._db_opened_as_current = True
 
     def _create_or_reuse_instance(self):
         """Create or attach to an Access instance with correct ownership.
@@ -151,7 +182,7 @@ class AccessConnection:
             app = self._get_access_app()
             
             # If Access already had the database open, CurrentDb() should work
-            if self._db_opened_via_getobject:
+            if self._db_opened_via_getobject or self._db_opened_as_current:
                 try:
                     db = app.CurrentDb()
                     if db is not None:
@@ -239,6 +270,7 @@ class AccessConnection:
         self._owns_app = False
         self._owns_db = False
         self._db_opened_via_getobject = False
+        self._db_opened_as_current = False
     
     def __enter__(self):
         """Context manager entry."""
