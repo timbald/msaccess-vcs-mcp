@@ -111,7 +111,13 @@ To rebuild `Version Control.accda` from source after editing add-in files, do **
 vcs_call_vba(db, "VCS.API", ["RebuildAddIn", r"C:\Repos\msaccess-vcs-addin\Version Control.accda.src"])
 ```
 
-Read `statusFile` from the JSON. Access then exits (a COM error on that call is expected). Poll `<source>/logs/rebuild-status.json` with the Read tool until `status` is `complete` or `*-failed`/`refused`. The rebuild refuses when another `MSACCESS.EXE` in the session holds a file it must replace, or cannot be asked which files it holds, and never closes another process; `otherInstances` in the refusal names what to close. `vcs_call_vba` has no timeout — the worker sleeps before quitting so the JSON can return.
+`db` only picks the Access instance that hosts the call; the source folder argument is what decides the rebuild. Pass whatever database the session already has open, or the add-in itself when nothing is — do not open an unrelated database to fill the parameter.
+
+Read `statusFile` from the JSON, then poll `<source>/logs/rebuild-status.json` with the Read tool until `status` is `complete` or `*-failed`/`refused`. Access exits a few seconds after the call returns, so a COM error on that call is possible.
+
+Only poll after `"status": "launched"`. `refused` and `launch-failed` are returned in the call's own JSON and mean nothing was rebuilt: `refused` when another `MSACCESS.EXE` holds a file the rebuild must replace or cannot be asked which files it holds (`otherInstances` names what to close; the add-in never closes another process), and `launch-failed` when the helper script did not start, which leaves Access open and is safe to retry. The add-in confirms the worker is running before returning `launched`, so a `launched` result means a rebuild is genuinely under way.
+
+If a polled status stops advancing, check `Get-Process MSACCESS,wscript` before waiting longer. A live rebuild always has at least one of them; neither, with a non-terminal status, means the run died and should be reported rather than retried blindly.
 
 ### Running the add-in's own tests
 

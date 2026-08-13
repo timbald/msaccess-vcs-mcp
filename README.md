@@ -281,15 +281,19 @@ vcs_rebuild_database("C:\\src\\mydb", "C:\\output\\fresh.accdb")
 
 ```python
 result = vcs_call_vba(
-    r"C:\path\to\Testing.accdb",
+    r"C:\path\to\any-open.accdb",
     "VCS.API",
     ["RebuildAddIn", r"C:\Repos\msaccess-vcs-addin\Version Control.accda.src"],
 )
-# result["result"] is JSON with statusFile. Access then exits (a COM error is expected).
-# Poll <source>/logs/rebuild-status.json until status is complete or *-failed/refused.
+# result["result"] is JSON with status and statusFile.
+# On "launched", poll <source>/logs/rebuild-status.json until complete or *-failed.
 ```
 
-The rebuild refuses when another `MSACCESS.EXE` in the Windows session holds one of the files it replaces — it checks the loaded VBA projects in each one, so an instance with an unrelated database open is left alone. An instance that cannot be asked also blocks it, because a busy instance rejects the automation calls that would answer and so looks identical to an idle one. It never closes another Access process. On refusal, `otherInstances` names each process, what was observed about it, and which file it holds, so you can close them deliberately. `vcs_call_vba` has no timeout; the worker sleeps before quitting so the JSON can return.
+The first argument only picks the Access instance that hosts the call — the source folder is what decides the rebuild. Use whatever database is already open, or `Version Control.accda` itself when nothing is; there is no need to open an unrelated database for it.
+
+The rebuild refuses when another `MSACCESS.EXE` in the Windows session holds one of the files it replaces — it checks the loaded VBA projects in each one, so an instance with an unrelated database open is left alone. An instance that cannot be asked also blocks it, because a busy instance rejects the automation calls that would answer and so looks identical to an idle one. It never closes another Access process. On refusal, `otherInstances` names each process, what was observed about it, and which file it holds, so you can close them deliberately.
+
+`refused` and `launch-failed` come back in the call's own JSON and mean nothing was rebuilt, so there is nothing to poll for. `launch-failed` means the helper script never started; Access is left open and the call is safe to retry. Only a `launched` result is worth polling, and the add-in confirms the worker is actually running before returning it. Access exits a few seconds later, so a COM error on that call is possible.
 
 #### Running the add-in's own tests
 

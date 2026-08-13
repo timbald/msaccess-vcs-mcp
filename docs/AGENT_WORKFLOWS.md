@@ -251,15 +251,19 @@ result = vcs_call_vba(
     "VCS.API",
     ["RebuildAddIn", r"C:\Repos\msaccess-vcs-addin\Version Control.accda.src"],
 )
-# Parse result["result"] for statusFile. Access then quits; a COM error is expected.
-# Poll <source>/logs/rebuild-status.json until status is complete or *-failed/refused.
+# Parse result["result"] for status and statusFile. Access quits a few seconds later.
+# On "launched", poll <source>/logs/rebuild-status.json until complete or *-failed.
 ```
 
+`db_path` only picks the host Access instance — the source folder decides the rebuild. Use a database already open in the session, or the add-in itself when none is.
+
 **Tips:**
+- Only `launched` is worth polling; `refused` and `launch-failed` are terminal in the call's own JSON
 - A `refused` result lists each other process in `otherInstances` with what was observed about it; close those yourself and call again
+- `launch-failed` means the helper script never started — Access stays open and the call is safe to retry
 - `compile-failed` leaves Access open on the rebuilt file for Debug > Compile
 - After `complete`, later MCP calls load the newly installed add-in
-- `vcs_call_vba` has no timeout; the worker sleeps before quitting so the JSON can return
+- A status that stops advancing is a stalled run, not a slow one; check `Get-Process MSACCESS,wscript` before waiting longer
 
 ### 6c. Run the add-in's own test suite
 
