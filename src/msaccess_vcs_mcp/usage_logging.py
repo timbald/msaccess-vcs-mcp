@@ -605,6 +605,9 @@ def _extract_error_pattern(error: str) -> str:
     if "write" in error_lower and "disabled" in error_lower:
         return "write_disabled"
 
+    if "server_busy" in error_lower or "another access operation is in progress" in error_lower:
+        return "server_busy"
+
     if "timeout" in error_lower or "timed out" in error_lower:
         return "timeout"
 
@@ -913,6 +916,42 @@ def get_log_file_path() -> Path | None:
     if _initialize_logging():
         return _log_file
     return None
+
+
+def read_recent_tool_calls(limit: int = 10) -> list[dict[str, Any]]:
+    """Return the most recent ``tool_call`` entries from the usage JSONL log.
+
+    Reads from the end of the file so callers can learn what executed after
+    a client-side MCP timeout discarded the response.
+    """
+    if limit <= 0:
+        return []
+
+    log_path = get_log_file_path()
+    if log_path is None or not log_path.exists():
+        return []
+
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+    entries: list[dict[str, Any]] = []
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if record.get("event") != "tool_call":
+            continue
+        entries.append(record)
+        if len(entries) >= limit:
+            break
+
+    entries.reverse()
+    return entries
 
 
 def is_logging_enabled() -> bool:

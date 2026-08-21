@@ -74,6 +74,144 @@ contradictory guidance.
 
 ---
 
+## 2026-08-21 — The installed add-in is never a target, for any tool
+
+**Trigger**: Agents repeatedly passed the installed add-in as `database_path` — to
+run the add-in's own tests, and to host `RebuildAddIn`. That file exists to be
+loaded as a library: opening it as a database, or writing into it, resets a VBA
+project while it is executing. A test run makes the point sharply, needing two
+roles at once from two different files (the install supplies the runner and
+`TestAssert`; the current database holds the code under test), so collapsing them
+makes the runner scan the library's own components and has
+`InstallTestAssertModule` write into the executing project. The server's own
+instructions had drifted into recommending the wrong host, naming "a user database
+Access already has open" for rebuilds — which sent agents hunting for a database to
+borrow, and into the add-in repo's `Testing` folder when they could not find one.
+
+**Options explored**:
+- *Rely on the add-in's VBA guard alone.* Rejected. `ExecuteTests` does refuse a
+  run there, but only once the install is already the current database — and
+  opening it as a database is the thing being prevented, not just the run that
+  follows. It also covers only test runs.
+- *Per-tool guards.* Tried and withdrawn within a day. Two were written, for
+  `vcs_run_tests` and for `RebuildAddIn` via `vcs_call_vba`, and they still left
+  `vcs_export_database`, `vcs_run_vba`, and the rebuild's own `output_path`
+  uncovered. Tailoring each message to name the right alternative host was the
+  argument for them, and it turned out there is only one answer to name.
+- *Compare full file names.* Rejected. An install configured for the compiled
+  add-in is a `.accde` built from the same `.accda`, and only one of the two
+  appears in `ACCESS_VCS_ADDIN_PATH`, so the other variant would slip past.
+- *Check folder parameters too* (`source_dir`, `output_dir`). Rejected. An export
+  folder beside the install is not the install, and refusing it would block reading
+  the install's own exported source.
+
+**Decision**: `_refuse_installed_addin_target` runs inside the `vcs_tool` wrapper,
+ahead of the gate and of any COM work, and rejects `database_path`, `output_path`,
+or `template_path` naming the install with `error_pattern:
+installed_addin_refused`. The comparison, `_is_installed_addin_path`, ignores the
+extension, mirroring the add-in's `modInstall.PathsMatchIgnoringExtension`. The
+message names the development copy in the add-in's repository and rules out the
+substitutes agents actually reached for: a user database, the repo's `Testing`
+folder, a scratch `.accdb`. `vcs_get_version_info()` is the sanctioned way to learn
+the installed version, and needs no path.
+
+**What this rules out**: Any tool reaching the installed file, including ones not
+yet written — a new tool inherits the refusal from the decorator. Hosting a rebuild
+or a test run on a borrowed database. Asking a person to nominate a host. A
+tool-specific exemption would have to be argued as an exemption, since there is no
+longer a per-tool guard to quietly omit.
+
+**Relevant files**: `src/msaccess_vcs_mcp/tools.py`
+(`_refuse_installed_addin_target`, `_is_installed_addin_path`,
+`_installed_addin_target_refusal`, `vcs_tool`), `AGENTS.md`, `README.md`,
+`docs/AGENT_WORKFLOWS.md`, `tests/test_installed_addin_guard.py`. The add-in side is
+`modInstall.CurrentDbIsInstalledAddIn` and the guard in
+`clsVersionControl.ExecuteTests`.
+
+---
+
+## 2026-08-21 — The install path comes from the add-in's own settings key
+
+**Trigger**: `get_default_addin_path()` built `%AppData%\MSAccessVCS\Version
+Control.accda` from constants. Both halves can be wrong: the installer lets the
+user choose a folder, and a compiled install is a `.accde` — the installer deletes
+the `.accda` in that case, so the guessed path names a file that does not exist.
+Refusing the installed add-in as a target made this load-bearing rather than
+merely untidy, since a wrong path means the refusal protects nothing.
+
+**Options explored**:
+- *Access Menu Add-Ins `Library` value.* Rejected. It does hold the full path with
+  the correct extension in one read, but it lives under
+  `Office\{Application.Version}\...`, and nothing records which Office version ran
+  the installer — an external reader has to enumerate versions and guess. Reading
+  two values from one fixed key is less machinery and no less certain.
+- *Ask a running Access instance for `GetInstalledAddInFileName`.* Rejected.
+  Requires COM and a loaded add-in to answer a question needed before either.
+- *Probe the disk for whichever of the two extensions exists.* Rejected as the
+  primary source: it infers from a side effect instead of reading the recorded
+  choice, and reports nothing when neither file is present.
+
+**Decision**: Read `HKCU\Software\VB and VBA Program Settings\MSAccessVCS\Install`
+— `Install Folder` and `Compile accde` — which is exactly what the add-in's
+`modInstall.GetInstalledAddInFileName` joins. `Install Folder` is absent for a
+default install because the installer deletes the value rather than writing the
+default, so absence means `%AppData%\MSAccessVCS`, not "not installed".
+`Compile accde` holds a VBA integer, so True arrives as `-1`. Cached for the life
+of the process, with `reset_addin_path_cache()` for tests and reinstalls.
+`ACCESS_VCS_ADDIN_PATH` still overrides everything.
+
+**What this rules out**: Reading the install path from anywhere else — the Menu
+Add-Ins registration, the trusted-location entry (folder only), or a reconstructed
+`%AppData%` path. Treating a missing `Install Folder` as a missing install.
+Assuming the extension.
+
+**Relevant files**: `src/msaccess_vcs_mcp/config.py`
+(`get_default_addin_path`, `_read_install_setting`, `reset_addin_path_cache`),
+`tests/test_config.py`. The add-in side is `modInstall.GetInstallSettings` /
+`GetInstalledAddInFileName`.
+
+---
+
+## 2026-08-21 — The vcs_call_vba timeout worker owns its COM apartment
+
+**Trigger**: Giving `vcs_call_vba` a hard timeout meant dispatching
+`Application.Run` on a daemon thread so the parent could stop waiting. Handing that
+thread the caller's `app` proxy failed before reaching Access at all —
+"CoInitialize has not been called" while the thread had no apartment,
+`RPC_E_WRONG_THREAD` (0x8001010E) once it did. Which of the two surfaced looked
+random, so the failure read as an add-in problem. `RebuildAddIn` was unreachable
+through this tool for as long as the timeout existed.
+
+**Options explored**:
+- *Marshal the caller's pointer into the worker* (`CoMarshalInterThreadInterfaceInStream`
+  / `CoGetInterfaceAndReleaseStream`). Rejected. A marshalled STA pointer serializes
+  the call back onto the apartment that created it, so the calling thread blocks
+  anyway and the timeout this function exists to impose never fires.
+- *Run the call on the main thread and time out around it.* Rejected. There is
+  nothing to time out around — a blocking COM call on the calling thread cannot be
+  abandoned.
+- *Re-acquire Access from the Running Object Table inside the worker* (chosen).
+  Yields an apartment-local proxy, and `VCSAddinIntegration._find_access_in_rot`
+  already existed for exactly this reason in the add-in probe.
+
+**Decision**: `_run_application_call_with_timeout` takes `db_path` and the worker
+calls `pythoncom.CoInitialize()`, then re-acquires the instance from the ROT. Without
+`db_path` there is nothing to look up, so the caller's proxy is used as before — no
+worse than it was, and the timeout may simply not fire.
+
+**What this rules out**: Sharing a COM proxy across threads anywhere in this server.
+Testing this path by stubbing `AccessConnection` alone — a test that does so silently
+reaches the real ROT and passes or fails depending on whether Access happens to be
+open, which is how `test_repo_addin_path_not_self_host_refused` became
+environment-dependent. Stub `_find_access_in_rot` too; `_fake_access` in
+`tests/test_call_vba_guards.py` wires both.
+
+**Relevant files**: `src/msaccess_vcs_mcp/tools.py`
+(`_run_application_call_with_timeout`), `src/msaccess_vcs_mcp/addin_integration.py`
+(`_find_access_in_rot`), `tests/test_call_vba_guards.py`.
+
+---
+
 ## 2026-08-12 — Access instances holding a database stay visible
 
 **Trigger**: COM automation starts Access hidden, and nothing in the server
@@ -121,6 +259,11 @@ timeout as sufficient handling for a blocked dialog.
 
 ## 2026-08-12 — Opening .accda as the current database for add-in self-tests
 
+> **⚠ Partially superseded** (2026-08-21): the `.accda` this opens is the
+> *development copy* in the add-in's repository. The installed copy is now refused
+> as a target by every tool, before anything opens it. See "The installed add-in is
+> never a target, for any tool" above.
+
 **Trigger**: The add-in's own tests only run when the add-in is the current
 database, because the runner walks `CurrentVBProject`. Every `vcs_run_tests`
 call against `Version Control.accda` failed with "Cannot find Access instance".
@@ -163,6 +306,13 @@ which would bypass the DAO fallback chain that predates this path.
 ---
 
 ## 2026-08-12 — Agentic add-in rebuild via existing vcs_call_vba
+
+> **⚠ Partially superseded** (2026-08-21): the host is the development copy of
+> the add-in in its repository, not an arbitrary open database — see "The
+> installed add-in is never a target, for any tool" above. `vcs_call_vba` also has a timeout now
+> (`ACCESS_VCS_CALL_VBA_TIMEOUT_SEC`), which closed the follow-up noted below and
+> brought its own COM constraint; see "The vcs_call_vba timeout worker owns its
+> COM apartment" above.
 
 **Trigger**: Agents iterating on the VCS add-in source could not rebuild
 `Version Control.accda` without a person, because server instructions told them

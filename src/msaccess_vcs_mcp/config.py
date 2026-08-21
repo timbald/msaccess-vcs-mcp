@@ -362,16 +362,68 @@ def get_project_root_info() -> dict[str, Any]:
     }
 
 
+# Where the add-in's installer records its choices, via VBA SaveSetting. This is the
+# only place to read an install path from: the add-in's own GetInstalledAddInFileName
+# is built from exactly these two values.
+_VBA_SETTINGS_INSTALL = r"Software\VB and VBA Program Settings\MSAccessVCS\Install"
+
+_ADDIN_BASENAME = "Version Control"
+_INSTALL_FOLDER_NAME = "MSAccessVCS"
+
+_cached_addin_path: str | None = None
+
+
+def _read_install_setting(value_name: str) -> str | None:
+    try:
+        import winreg
+    except ImportError:  # Not Windows.
+        return None
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _VBA_SETTINGS_INSTALL) as key:
+            value, _kind = winreg.QueryValueEx(key, value_name)
+    except OSError:
+        return None
+
+    if not isinstance(value, str):
+        return None
+    value = os.path.expandvars(value.strip().strip('"'))
+    return value or None
+
+
 def get_default_addin_path() -> str:
+    """Where the add-in is installed, when ``ACCESS_VCS_ADDIN_PATH`` says nothing.
+
+    Mirrors the add-in's ``modInstall.GetInstalledAddInFileName``, which joins the
+    install folder to the base name and picks the extension from the compile setting.
+    Both come from the same registry key the installer writes.
+
+    ``Install Folder`` is present only for a folder the user chose; the installer
+    deletes the value when the folder is the default, so its absence means
+    ``%AppData%\\MSAccessVCS`` rather than "not installed". ``Compile accde`` holds a
+    VBA integer, so True arrives as ``-1``. A compiled install keeps only the
+    ``.accde`` and deletes the ``.accda``, which is why the extension cannot be
+    assumed.
+
+    Cached: the install location does not change while the server runs, and every
+    tool call consults it.
     """
-    Get default VCS add-in installation path.
-    
-    Returns:
-        Path to add-in file at default installation location
-    """
-    # Default installation location: %AppData%\MSAccessVCS\Version Control.accda
-    appdata = os.environ.get("APPDATA", "")
-    return os.path.join(appdata, "MSAccessVCS", "Version Control.accda")
+    global _cached_addin_path
+
+    if _cached_addin_path is None:
+        folder = _read_install_setting("Install Folder")
+        if not folder:
+            folder = os.path.join(os.environ.get("APPDATA", ""), _INSTALL_FOLDER_NAME)
+        compiled = _read_install_setting("Compile accde") not in (None, "", "0")
+        extension = ".accde" if compiled else ".accda"
+        _cached_addin_path = os.path.join(folder, _ADDIN_BASENAME + extension)
+    return _cached_addin_path
+
+
+def reset_addin_path_cache() -> None:
+    """Forget the resolved install path (tests, and after a reinstall)."""
+    global _cached_addin_path
+    _cached_addin_path = None
 
 
 def load_config() -> dict[str, Any]:

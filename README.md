@@ -281,15 +281,16 @@ vcs_rebuild_database("C:\\src\\mydb", "C:\\output\\fresh.accdb")
 
 ```python
 result = vcs_call_vba(
-    r"C:\path\to\any-open.accdb",
+    r"C:\path\to\msaccess-vcs-addin\Version Control.accda",
     "VCS.API",
-    ["RebuildAddIn", r"C:\Repos\msaccess-vcs-addin\Version Control.accda.src"],
+    ["RebuildAddIn", r"C:\path\to\msaccess-vcs-addin\Version Control.accda.src"],
 )
 # result["result"] is JSON with status and statusFile.
-# On "launched", poll <source>/logs/rebuild-status.json until complete or *-failed.
+# On "launched", poll <source>/logs/rebuild-status.json until complete or *-failed,
+# matching phaseStarted against result["rebuild_phase_started"].
 ```
 
-The first argument only picks the Access instance that hosts the call — the source folder is what decides the rebuild. Use whatever database is already open, or `Version Control.accda` itself when nothing is; there is no need to open an unrelated database for it.
+The first argument only picks the Access instance that hosts the call — the source folder is what decides the rebuild. Host it on the development copy of the add-in in its repository, the `Version Control.accda` beside the source folder: rebuilding the add-in is a repository operation and belongs to the repository's own copy, which closes itself once the worker handoff is confirmed. Do not open a user database, anything in the repository's `Testing` folder, or a scratch `.accdb` to satisfy the parameter. The installed add-in is refused here as everywhere — see [The installed add-in is never a target](#the-installed-add-in-is-never-a-target).
 
 The rebuild refuses when another `MSACCESS.EXE` in the Windows session holds one of the files it replaces — it checks the loaded VBA projects in each one, so an instance with an unrelated database open is left alone. An instance that cannot be asked also blocks it, because a busy instance rejects the automation calls that would answer and so looks identical to an idle one. It never closes another Access process. On refusal, `otherInstances` names each process, what was observed about it, and which file it holds, so you can close them deliberately.
 
@@ -297,13 +298,25 @@ The rebuild refuses when another `MSACCESS.EXE` in the Windows session holds one
 
 #### Running the add-in's own tests
 
-Pass the add-in itself as the database path:
+Pass the development copy in the add-in's repository as the database path:
 
 ```python
-vcs_run_tests(r"C:\Repos\msaccess-vcs-addin\Version Control.accda", filter="clsTestInstall")
+vcs_run_tests(r"C:\path\to\msaccess-vcs-addin\Version Control.accda", filter="clsTestInstall")
 ```
 
-The add-in's tests only run when the add-in is the current database, because the test runner scans the current VBA project — a run aimed at a user database finds that database's tests instead. The server opens the `.accda` as the current database for you, so there is no manual pre-open step.
+A run needs two projects and they are different files: the installed add-in loads as a library and supplies the runner and `TestAssert`, while the code under test is whatever the current database holds. The runner scans the current VBA project, so the host decides which tests are found — a run aimed at a user database, or at anything in the repository's `Testing` folder, finds that database's tests instead. The server opens the development copy as the current database for you, so there is no manual pre-open step.
+
+The installed add-in is refused as a host (see below), and it has no source tree beside it for the tests that read one. The add-in refuses such a run itself, so the server's refusal is the earlier of two.
+
+#### The installed add-in is never a target
+
+No tool accepts the installed add-in as `database_path`, `output_path`, or `template_path`. That file exists to be loaded as a library: opening it as a database, or writing into it, resets a VBA project while it is executing. The check runs before the Access gate and before any COM work, so it applies to every tool — export, import, rebuild, `vcs_run_vba`, `vcs_run_tests`, `vcs_call_vba`, and the rest. Refusals carry `error_pattern: installed_addin_refused`.
+
+`vcs_get_version_info()` reports the installed add-in's version without opening it.
+
+The comparison ignores the file extension, since a compiled install is a `.accde` built from the same `.accda`. Folder parameters are not checked — an export folder beside the install is not the install.
+
+With `ACCESS_VCS_ADDIN_PATH` unset, the install path comes from `HKCU\Software\VB and VBA Program Settings\MSAccessVCS\Install`, the same `Install Folder` and `Compile accde` values the add-in's own installer writes. `Install Folder` is absent for a default install, which means `%AppData%\MSAccessVCS`.
 
 Run these tests through the server rather than from the add-in's own window. Assertions are recorded by the runner in whichever project received the call, while `TestAssert` always routes to the *installed* add-in, so a run started inside a development copy discards every assertion and reports `EMPTY` for each test. An all-`EMPTY` result means the harness was bypassed, not that the tests passed.
 

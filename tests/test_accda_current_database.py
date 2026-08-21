@@ -15,8 +15,8 @@ import pytest
 from msaccess_vcs_mcp.access_com import connection as conn_mod
 from msaccess_vcs_mcp.access_com.connection import AccessConnection
 
-ACCDA = r"C:\Repos\msaccess-vcs-addin\Version Control.accda"
-ACCDB = r"C:\Repos\other\Some Database.accdb"
+ACCDA = r"C:\Projects\msaccess-vcs-addin\Version Control.accda"
+ACCDB = r"C:\Projects\other\Some Database.accdb"
 
 
 def _app_with_current_db(path):

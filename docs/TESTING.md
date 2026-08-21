@@ -7,7 +7,7 @@ This guide covers testing procedures for the MCP tool, including unit tests, int
 All test commands assume the project virtual environment is activated. Activate it before running any tests:
 
 ```powershell
-cd C:\Repos\msaccess-vcs-mcp
+cd C:\path\to\msaccess-vcs-mcp
 .\venv\Scripts\Activate.ps1
 ```
 

@@ -32,7 +32,9 @@ import inspect
 import json
 import os
 import sys
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -41,6 +43,7 @@ from mcp.server.fastmcp import FastMCP, Context
 
 from .access_com.connection import AccessConnection, ensure_access_visible
 from .access_com.dao_helpers import list_query_defs, list_table_defs
+from .access_gate import EXEMPT_TOOLS, get_access_gate
 from .config import (
     get_config,
     get_callback_url,
@@ -55,8 +58,13 @@ from .security import (
     validate_source_directory,
     check_write_permission,
 )
-from .usage_logging import log_code_execution, log_diagnostic_event, with_logging
-from .vba_worker_manager import run_vba_resilient
+from .usage_logging import (
+    log_code_execution,
+    log_diagnostic_event,
+    read_recent_tool_calls,
+    with_logging,
+)
+from .vba_worker_manager import get_call_vba_timeout, run_vba_resilient
 
 _COMPILE_FAILURE_AGENT_GUIDANCE = (
     "Compilation failed. MCP cannot report the failing module or line. "
@@ -252,13 +260,20 @@ mcp = FastMCP(
         "To rebuild `Version Control.accda` from source after editing add-in files, "
         "call vcs_call_vba(db, \"VCS.API\", [\"RebuildAddIn\", \"<source folder>\"]). "
         "`db` only picks the Access instance that hosts the call; the source folder is what "
-        "decides the rebuild. Pass a database the session already has open, or the add-in "
-        "itself when there is none -- do not open an unrelated database for this parameter. "
+        "decides the rebuild. Pass the **development copy** of the add-in from its "
+        "repository (the `Version Control.accda` beside the source folder). That host "
+        "holds the build target and closes itself once the handoff is confirmed. Do NOT "
+        "open a user database, anything in the repo's Testing folder, or a scratch "
+        "database to host this -- rebuilding the add-in is a repository operation and "
+        "belongs to the repository's own copy. "
         "On `\"status\": \"launched\"`, poll `<source folder>/logs/rebuild-status.json` with "
-        "the Read tool until status is `complete` or `*-failed`. Access exits a few seconds "
+        "the Read tool until status is `complete` or `*-failed`. Match the file's "
+        "`phaseStarted` against the one the call returned — a different value is another "
+        "run's record, not yours. Access exits a few seconds "
         "after the call returns, so a COM error on that call is possible.\n"
         "`refused` and `launch-failed` are returned in the call's own JSON and mean nothing "
-        "was rebuilt, so there is nothing to poll for. The rebuild refuses when another "
+        "was rebuilt, so there is nothing to poll for; an attempt that reached a valid "
+        "source folder also records its refusal in the status file. The rebuild refuses when another "
         "MSACCESS.EXE in the Windows session holds one of the files it replaces, and never "
         "closes another Access process. It checks the loaded VBA projects in each one, so an "
         "instance with an unrelated database open does not block it; an instance that cannot "
@@ -270,15 +285,37 @@ mcp = FastMCP(
         "it -- so a status that then stops advancing is a stalled run, not a slow one. Check "
         "`Get-Process MSACCESS,wscript`: a live rebuild always has at least one.\n"
         "This is not vcs_rebuild_database, which rebuilds a user project.\n"
-        "Note: vcs_call_vba has no timeout.\n\n"
+        "After any MCP client timeout (`-32001`), call vcs_get_recent_calls() to learn "
+        "what actually executed — the server may have finished after the client gave up.\n"
+        "One server process is shared across Cursor windows. When another window holds the "
+        "Access gate, tools return `error_pattern: server_busy` with `busy_with` naming the "
+        "in-flight tool — retry instead of waiting for a client timeout.\n"
+        "vcs_call_vba has a server-side timeout (default 45s via "
+        "ACCESS_VCS_CALL_VBA_TIMEOUT_SEC); raising it above the client's request timeout "
+        "brings `-32001` back.\n\n"
         "**Running the add-in's own tests:**\n"
-        "Pass the add-in path (`Version Control.accda`) as database_path. Its tests only "
-        "run when the add-in is the current database, since the runner scans the current "
-        "VBA project; pointing a run at a user database finds that database's tests "
-        "instead. This server opens the .accda as the current database for you, so no "
-        "manual pre-open step is needed. Always run these tests through this server "
-        "rather than from the add-in's own window -- an all-EMPTY result (zero "
-        "assertions) means the harness was bypassed, not that the tests passed.\n\n"
+        "Pass the **development copy** in the add-in's repository -- the `Version "
+        "Control.accda` beside `Version Control.accda.src` -- as database_path. The "
+        "runner scans the current VBA project, so that copy is the code under test, "
+        "while the installed add-in loads as a library and supplies the runner and "
+        "TestAssert. Both roles are required and they are different files. A user "
+        "database or anything in the repo's Testing folder finds that database's tests "
+        "instead. This server opens the development copy for you, so no manual pre-open "
+        "step is needed. Always run these tests through this server rather than from the "
+        "add-in's own window -- an all-EMPTY result (zero assertions) means the harness "
+        "was bypassed, not that the tests passed.\n\n"
+        "**The installed add-in is never a target:**\n"
+        "No tool accepts the installed add-in under %APPDATA%\\MSAccessVCS as "
+        "database_path, output_path, or template_path. That file exists to be loaded as "
+        "a library: opening it as a database, or writing into it, resets a VBA project "
+        "while it is executing. Any such call is refused with "
+        "`error_pattern: installed_addin_refused` before Access is touched, whichever "
+        "tool it was -- export, import, rebuild, run_vba, run_tests, call_vba, or "
+        "anything else. Work on the development copy in the add-in's repository and "
+        "rebuild from there; the rebuild is what replaces the installed file. "
+        "vcs_get_version_info() reports the installed add-in's version without opening "
+        "it. The comparison ignores the file extension, because a compiled install is a "
+        "`.accde` built from the same `.accda`.\n\n"
         "**VBA compile failures:**\n"
         "MCP compile tools return success/failure only — not the failing module or line. "
         "When vcs_compile_vba returns success=false (or vcs_check_vba_compiled shows "
@@ -304,7 +341,7 @@ mcp = FastMCP(
         "— compare database against source files\n"
         "- vcs_run_vba(database_path*, code*, timeout_seconds?) "
         "— execute agent-generated VBA in a temporary module\n"
-        "- vcs_call_vba(database_path*, function_name*, args?) "
+        "- vcs_call_vba(database_path*, function_name*, args?, timeout_seconds?) "
         "— call an existing public VBA function\n"
         "- vcs_execute_sql(database_path*, sql*, max_rows?) "
         "— run a read-only SELECT query via DAO\n"
@@ -315,6 +352,7 @@ mcp = FastMCP(
         "- vcs_set_option(database_path*, option_name*, value*) "
         "— set a VCS option for this session\n"
         "- vcs_get_log(database_path*, log_type?) — read Export or Build log\n"
+        "- vcs_get_recent_calls(limit?) — recent tool_call entries from the usage log\n"
         "- vcs_end_session(database_path*) — end session, remove option overrides\n"
         "- vcs_cancel_operation(operation_id*) — cancel a running async operation\n\n"
         "**Common mistakes to avoid:**\n"
@@ -503,8 +541,9 @@ def vcs_tool(name: str):
 
     The wrapper is *always* an async coroutine. FastMCP detects this via
     ``inspect.iscoroutinefunction`` and awaits it correctly. Sync tool
-    bodies are still invoked synchronously inside the wrapper -- there is
-    no concurrency change relative to FastMCP's default sync handling.
+    bodies run in a single COM apartment thread via :mod:`access_gate` so
+    they no longer block the asyncio event loop. One Access operation runs
+    at a time across all Cursor windows sharing this server process.
     """
     def decorator(func):
         logged = with_logging(name)(func)
@@ -524,9 +563,32 @@ def vcs_tool(name: str):
                 ctx = None
             await _ensure_env_loaded(ctx)
             load_config()
-            if is_async_body:
-                return await logged(*args, **kwargs)
-            return logged(*args, **kwargs)
+
+            refusal = _refuse_installed_addin_target(name, func, args, kwargs)
+            if refusal is not None:
+                return refusal
+
+            if name in EXEMPT_TOOLS:
+                if is_async_body:
+                    return await logged(*args, **kwargs)
+                return logged(*args, **kwargs)
+
+            database = kwargs.get("database_path")
+            if database is None and args:
+                sig = inspect.signature(func)
+                param_names = list(sig.parameters.keys())
+                if param_names and param_names[0] == "database_path":
+                    database = args[0]
+
+            gate = get_access_gate()
+            return await gate.run_exclusive(
+                name,
+                str(database) if database is not None else None,
+                logged,
+                is_async_body,
+                *args,
+                **kwargs,
+            )
 
         return mcp.tool()(with_refresh)
     return decorator
@@ -1368,6 +1430,34 @@ async def vcs_get_version_info(
     return result
 
 
+@vcs_tool("vcs_get_recent_calls")
+def vcs_get_recent_calls(limit: int = 10) -> dict[str, Any]:
+    """
+    Return recent tool-call entries from the usage JSONL log.
+
+    After an MCP client timeout (``-32001``), the server may still finish the
+    request and write a usage-log entry even though the response was discarded.
+    Use this tool to see what actually ran instead of inferring from side
+    effects such as ``rebuild-status.json``.
+
+    Args:
+        limit: Maximum number of recent ``tool_call`` entries (default 10)
+
+    Returns:
+        Dictionary with ``success``, ``entries``, and ``log_path``
+    """
+    from .usage_logging import get_log_file_path
+
+    entries = read_recent_tool_calls(limit=limit)
+    log_path = get_log_file_path()
+    return {
+        "success": True,
+        "entries": entries,
+        "log_path": str(log_path) if log_path else None,
+        "count": len(entries),
+    }
+
+
 @vcs_tool("vcs_cancel_operation")
 def vcs_cancel_operation(operation_id: str) -> dict[str, Any]:
     """
@@ -1744,7 +1834,8 @@ def vcs_execute_sql(
 def vcs_call_vba(
     database_path: str,
     function_name: str,
-    args: list[str] | None = None
+    args: list[str] | None = None,
+    timeout_seconds: float | None = None,
 ) -> dict[str, Any]:
     """
     Call an existing public VBA function by name.
@@ -1759,6 +1850,14 @@ def vcs_call_vba(
     try to reach the API from inside vcs_run_vba: that code is itself delivered through
     modAPI.API, so calling back into the API is a re-entrant call and will be refused.
 
+    **Host RebuildAddIn on the development copy of the add-in** -- the
+    ``Version Control.accda`` beside the source folder in its repository. Rebuilding the
+    add-in is a repository operation and belongs to the repository's own copy, which
+    closes itself once the worker handoff is confirmed. Do not open a user database,
+    anything in the repo's Testing folder, or a scratch .accdb to satisfy the parameter.
+    The installed add-in is refused as ``database_path`` here as it is everywhere, with
+    ``installed_addin_refused``.
+
     Examples:
         vcs_call_vba("C:\\\\db.accdb", "MyModule.GetQuerySQL", ["qryCustomers"])
         vcs_call_vba("C:\\\\db.accdb", "VCS.API", ["GetVCSVersion"])
@@ -1770,10 +1869,24 @@ def vcs_call_vba(
         function_name: Fully qualified function name (e.g., "ModuleName.FunctionName"),
             or a VCS add-in alias such as "VCS.API"
         args: Optional list of string arguments to pass to the function
+        timeout_seconds: Optional server-side timeout. Defaults to
+            ACCESS_VCS_CALL_VBA_TIMEOUT_SEC (45 seconds). Keep below the MCP
+            client's request timeout or the client may return -32001 with no JSON.
 
     Returns:
-        Dictionary with the function's return value or error
+        Dictionary with the function's return value or error. RebuildAddIn calls
+        also include ``rebuild_status_file`` and ``rebuild_status_before``.
     """
+    rebuild_status_file: str | None = None
+    rebuild_status_before: dict[str, Any] | None = None
+
+    def _with_rebuild_context(result: dict[str, Any]) -> dict[str, Any]:
+        if rebuild_status_file:
+            result["rebuild_status_file"] = rebuild_status_file
+        if rebuild_status_before is not None:
+            result["rebuild_status_before"] = rebuild_status_before
+        return result
+
     try:
         db_path = validate_database_path(database_path)
         call_args = args or []
@@ -1784,22 +1897,48 @@ def vcs_call_vba(
         log_code_execution("vcs_call_vba", str(db_path), call_description, code_type="vba_call")
 
         if len(call_args) > 3:
-            return {
+            return _with_rebuild_context({
                 "success": False,
-                "error": "Maximum 3 arguments supported for vcs_call_vba"
-            }
+                "error": "Maximum 3 arguments supported for vcs_call_vba",
+            })
+
+        is_rebuild = (
+            _is_addin_api_resolved_name(resolved_name)
+            and len(call_args) >= 2
+            and str(call_args[0]) == "RebuildAddIn"
+        )
+        if is_rebuild:
+            rebuild_status_file, rebuild_status_before = _snapshot_rebuild_status(str(call_args[1]))
+
+        timeout = get_call_vba_timeout(timeout_seconds)
 
         with AccessConnection(str(db_path)) as conn:
             app, db = conn.connect()
 
-            try:
-                result = app.Run(resolved_name, *call_args)
-            except Exception as e:
-                return {
+            run_result = _run_application_call_with_timeout(
+                app, resolved_name, call_args, timeout, str(db_path)
+            )
+
+            if run_result.get("timed_out"):
+                return _with_rebuild_context({
                     "success": False,
-                    "error": _describe_run_failure(e, resolved_name, function_name),
+                    "error": run_result["error"],
+                    "error_pattern": "timeout",
+                    "recoverable": True,
+                    "timed_out": True,
                     "function": resolved_name,
-                }
+                    "duration_ms": run_result.get("duration_ms"),
+                })
+
+            if not run_result.get("success"):
+                exc = run_result.get("error")
+                return _with_rebuild_context({
+                    "success": False,
+                    "error": _describe_run_failure(exc, resolved_name, function_name),
+                    "function": resolved_name,
+                })
+
+            result = run_result["result"]
 
             # Early-bound Run returns a tuple: the function's return value followed by
             # Run's own 30 Arg slots (unused ones show DISP_E_PARAMNOTFOUND). Only the
@@ -1811,20 +1950,28 @@ def vcs_call_vba(
             # the add-in cannot raise across the library boundary without producing a
             # modal dialog. Report it as a failure so it is not mistaken for data.
             if isinstance(result, str) and result.startswith(_API_REFUSED_PREFIX):
-                return {
+                return _with_rebuild_context({
                     "success": False,
                     "error": result[len(_API_REFUSED_PREFIX):],
                     "function": resolved_name,
-                }
+                })
 
-            return {
+            response: dict[str, Any] = {
                 "success": True,
                 "result": str(result) if result is not None else None,
                 "function": resolved_name,
             }
 
+            if is_rebuild:
+                _log_rebuild_call_result(result)
+                response.update(
+                    _describe_rebuild_attempt(result, rebuild_status_before)
+                )
+
+            return _with_rebuild_context(response)
+
     except Exception as e:
-        return {"success": False, "error": str(e)}
+        return _with_rebuild_context({"success": False, "error": str(e)})
 
 
 # Qualifiers that mean "the VCS add-in library". Application.Run resolves a bare
@@ -1872,6 +2019,234 @@ def _describe_run_failure(error: Exception, resolved_name: str, requested_name: 
         'not a file name. To reach the VCS add-in, pass "VCS.API" as function_name; '
         "it is rewritten to the add-in's full path, which also loads it on demand."
     )
+
+
+def _configured_addin_lib_prefix() -> str | None:
+    addin_path = get_config().get("ACCESS_VCS_ADDIN_PATH")
+    if not addin_path:
+        return None
+    return os.path.splitext(os.path.abspath(addin_path))[0]
+
+
+def _is_addin_api_resolved_name(resolved_name: str) -> bool:
+    prefix = _configured_addin_lib_prefix()
+    if not prefix:
+        return False
+    return resolved_name.lower().startswith(prefix.lower() + ".")
+
+
+def _is_installed_addin_path(database_path: str) -> bool:
+    """True when a path names the installed add-in file.
+
+    Compared without the extension, mirroring the add-in's own
+    ``modInstall.PathsMatchIgnoringExtension``: an install configured for the compiled
+    add-in is a ``.accde`` built from the same ``.accda``, and the configured path names
+    only one of the two. Matching on the full name lets the other variant slip past.
+    """
+    addin_path = get_config().get("ACCESS_VCS_ADDIN_PATH")
+    if not addin_path:
+        return False
+    return os.path.normcase(os.path.splitext(database_path)[0]) == os.path.normcase(
+        os.path.splitext(os.path.abspath(addin_path))[0]
+    )
+
+
+# Parameters that name a file a tool opens, writes, or replaces. Checked against the
+# installed add-in on every call. `source_dir` and `output_dir` are folders, and an
+# export folder beside the install is not the install.
+_ADDIN_TARGET_PARAMETERS = ("database_path", "output_path", "template_path")
+
+
+def _installed_addin_target_refusal(
+    tool: str, parameter: str, target: str
+) -> dict[str, Any]:
+    return {
+        "success": False,
+        "error": (
+            f"Refusing {tool}: {parameter} names the installed add-in ({target}). That "
+            "file exists to be loaded as a library -- it is never opened as a database, "
+            "and never modified in place, which would reset a VBA project while it is "
+            "executing. Work on the development copy of the add-in in its repository, "
+            "the 'Version Control.accda' beside its source folder, and rebuild from "
+            "there; the rebuild is what replaces the installed file. Do not substitute "
+            "a user database, anything in the repository's Testing folder, or a scratch "
+            ".accdb. vcs_get_version_info() reports the installed add-in's version "
+            "without opening it."
+        ),
+        "error_pattern": "installed_addin_refused",
+        "recoverable": True,
+    }
+
+
+def _refuse_installed_addin_target(
+    tool: str, func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Refuse any call that names the installed add-in as a file to act on.
+
+    One check for every tool, ahead of the gate and of any COM work, because the harm
+    is in opening or replacing the file at all rather than in what a particular tool
+    goes on to do with it. Per-tool guards had already been written twice and still
+    left `vcs_export_database`, `vcs_run_vba`, and the rebuild's `output_path`
+    uncovered.
+    """
+    try:
+        bound = inspect.signature(func).bind_partial(*args, **kwargs)
+    except TypeError:
+        # A malformed call: let the real signature error surface from the body.
+        return None
+
+    for parameter in _ADDIN_TARGET_PARAMETERS:
+        value = bound.arguments.get(parameter)
+        if isinstance(value, str) and value and _is_installed_addin_path(value):
+            log_diagnostic_event(
+                "installed_addin_refused", tool=tool, parameter=parameter
+            )
+            return _installed_addin_target_refusal(tool, parameter, value)
+    return None
+
+
+def _describe_rebuild_attempt(
+    result: Any, status_before: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Report which attempt the status file now describes.
+
+    RebuildAddIn returns the ``phaseStarted`` it stamped, and holds that value for the
+    rest of the run, so it identifies the attempt across every record the run writes.
+    Comparing it against the snapshot taken before the call is what distinguishes a file
+    this attempt wrote from one left behind by an earlier run -- the mistake that used to
+    let a refusal be read as a prior ``complete``.
+    """
+    if not isinstance(result, str):
+        return {}
+
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+
+    phase_started = parsed.get("phaseStarted")
+    if not phase_started:
+        return {}
+
+    described: dict[str, Any] = {"rebuild_phase_started": phase_started}
+    if status_before is not None:
+        described["rebuild_status_superseded"] = (
+            status_before.get("phaseStarted") != phase_started
+        )
+    return described
+
+
+def _rebuild_status_path(source_dir: str) -> str:
+    return os.path.join(source_dir.rstrip("\\/"), "logs", "rebuild-status.json")
+
+
+def _snapshot_rebuild_status(source_dir: str) -> tuple[str, dict[str, Any] | None]:
+    status_file = _rebuild_status_path(source_dir)
+    if not os.path.isfile(status_file):
+        return status_file, None
+
+    try:
+        mtime = os.path.getmtime(status_file)
+        # The add-in writes this file as UTF-8 with a BOM, which plain "utf-8" keeps
+        # in the string and json.load then rejects. Reading it as "utf-8" reported
+        # read_error for every snapshot and left the phaseStarted comparison inert.
+        with open(status_file, encoding="utf-8-sig") as handle:
+            data = json.load(handle)
+        return status_file, {
+            "status": data.get("status"),
+            "updated": data.get("updated"),
+            "phaseStarted": data.get("phaseStarted"),
+            "mtime": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+        }
+    except (OSError, json.JSONDecodeError):
+        return status_file, {"status": None, "updated": None, "read_error": True}
+
+
+def _log_rebuild_call_result(result: Any) -> None:
+    status_value: str | None = None
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+            if isinstance(parsed, dict):
+                status_value = parsed.get("status")
+        except json.JSONDecodeError:
+            pass
+    elif isinstance(result, dict):
+        status_value = result.get("status")
+
+    log_diagnostic_event(
+        "rebuild_addin_call_result",
+        status=status_value,
+        result_type=type(result).__name__,
+    )
+
+
+def _run_application_call_with_timeout(
+    app: Any,
+    resolved_name: str,
+    call_args: list[str],
+    timeout_seconds: float,
+    db_path: str | None = None,
+) -> dict[str, Any]:
+    """Run ``Application.Run`` in a daemon thread with a hard join timeout.
+
+    The thread needs its own COM apartment and its own proxy. Handing it the caller's
+    STA proxy fails before it ever reaches Access -- "CoInitialize has not been called"
+    while the thread has no apartment, RPC_E_WRONG_THREAD once it does -- which is what
+    made RebuildAddIn unreachable through this tool. Re-acquiring the instance from the
+    Running Object Table yields an apartment-local proxy, the approach
+    ``VCSAddinIntegration`` already uses for its probe. Marshalling the caller's pointer
+    across instead would serialize the call back onto the calling thread and defeat the
+    timeout this function exists to impose.
+
+    Without ``db_path`` there is nothing to look up, so the caller's proxy is used as
+    before: no worse than it was, and the timeout may simply not fire.
+    """
+    result_box: dict[str, Any] = {}
+    start = time.perf_counter()
+
+    def worker() -> None:
+        import pythoncom
+
+        try:
+            pythoncom.CoInitialize()
+            try:
+                worker_app = (
+                    VCSAddinIntegration._find_access_in_rot(db_path) if db_path else app
+                )
+                if worker_app is None:
+                    raise RuntimeError(
+                        f"Cannot find Access instance for {db_path} from the worker "
+                        "thread. The Access application may have been closed."
+                    )
+                result_box["result"] = worker_app.Run(resolved_name, *call_args)
+                result_box["success"] = True
+            finally:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+        except Exception as exc:
+            result_box["success"] = False
+            result_box["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True, name="vcs-call-vba")
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
+
+    if thread.is_alive():
+        return {
+            "success": False,
+            "timed_out": True,
+            "error": f"VBA function call timed out after {timeout_seconds} seconds",
+            "duration_ms": duration_ms,
+        }
+
+    result_box["duration_ms"] = duration_ms
+    return result_box
 
 
 @vcs_tool("vcs_run_vba")
@@ -2181,6 +2556,12 @@ def vcs_run_tests(
     **Prerequisite:** The target database must have ``modTestAssert`` installed
     (via the VCS ribbon or ``VCS.InstallTestAssertModule``). In unattended mode
     the install prompt is suppressed, so pre-install before calling this tool.
+
+    **To run the add-in's own suite, pass the development copy in its repository** --
+    the ``Version Control.accda`` beside ``Version Control.accda.src``. The runner scans
+    the current VBA project, so the host database is the code under test, while the
+    installed add-in loads as a library and supplies the runner and TestAssert. Passing
+    the installed add-in is refused with ``installed_addin_refused`` before it is opened.
 
     Examples:
         vcs_run_tests("C:\\\\db.accdb")

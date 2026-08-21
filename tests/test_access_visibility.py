@@ -18,7 +18,7 @@ from msaccess_vcs_mcp.access_com.connection import (
     open_current_database,
 )
 
-DB = r"C:\Repos\other\Some Database.accdb"
+DB = r"C:\Projects\other\Some Database.accdb"
 
 
 class _FakeApp:
