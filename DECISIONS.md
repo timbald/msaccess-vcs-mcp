@@ -74,6 +74,24 @@ contradictory guidance.
 
 ---
 
+## 2026-08-21 — Self-heal corrupted pywin32 gen_py cache
+
+**Trigger**: MCP startup died with `module 'win32com.gen_py.4AFFC9A0-...' has no attribute 'CLSIDToClassMap'` when `%TEMP%\gen_py` held a half-built Access type-library folder (only `__pycache__`, no wrapper `.py` files). Deleting the folder manually and retrying `EnsureDispatch` regenerated the wrappers and succeeded. The failure had recurred several times.
+
+**Options explored**:
+- **Do nothing** — users must manually delete `%TEMP%\gen_py`. Simple, but fatal: `validate_access_installation()` exits and Cursor reports `MCP error -32000: Connection closed`.
+- **Wipe all of `gen_py` on every startup** — always safe, but forces a full makepy rebuild for every COM library the process touches.
+- **Fall back to late-bound `Dispatch`** — avoids the cache, but breaks early-binding semantics (`Application.Run` return shape).
+- **Targeted folder delete + one retry** — parse the type-library folder from the `AttributeError`, `rmtree` only that folder, drop `sys.modules` entries, `gencache.Rebuild()`, retry `EnsureDispatch` once.
+
+**Decision**: Centralize early-bound dispatch in `ensure_dispatch()` (`access_com/connection.py`) with targeted purge and a single retry. Route every `EnsureDispatch("Access.Application")` call site through it. Log `gen_py_cache_rebuilt` to the diagnostic stream.
+
+**What this rules out**: Startup wipe-all of `gen_py`. Late-bind fallback for Access Application dispatch. Folding this into `com_recovery.py` (that module is for live RPC disconnects, not local makepy cache repair). More than one automatic retry per call.
+
+**Relevant files**: `src/msaccess_vcs_mcp/access_com/connection.py`, `config.py`, `validation.py`, `tools.py`, `usage_logging.py` (`gen_py_cache` error pattern), `tests/test_gen_py_cache.py`.
+
+---
+
 ## 2026-08-21 — The installed add-in is never a target, for any tool
 
 **Trigger**: Agents repeatedly passed the installed add-in as `database_path` — to

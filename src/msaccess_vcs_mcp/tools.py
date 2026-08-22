@@ -41,7 +41,7 @@ from urllib.parse import unquote, urlparse
 
 from mcp.server.fastmcp import FastMCP, Context
 
-from .access_com.connection import AccessConnection, ensure_access_visible
+from .access_com.connection import AccessConnection, ensure_access_visible, ensure_dispatch
 from .access_com.dao_helpers import list_query_defs, list_table_defs
 from .access_gate import EXEMPT_TOOLS, get_access_gate
 from .config import (
@@ -1245,8 +1245,7 @@ async def vcs_rebuild_database(
         # open yet -- the add-in's build process creates it.  Create a
         # bare Access instance (no AccessConnection, which requires a
         # database path) and manage its lifecycle with try/finally.
-        from win32com.client import gencache
-        app = gencache.EnsureDispatch("Access.Application")
+        app = ensure_dispatch("Access.Application")
         # The build creates and populates a database in this instance, so any
         # prompt it raises has to be visible to be answerable.
         ensure_access_visible(app)

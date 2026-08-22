@@ -323,6 +323,11 @@ class TestErrorPatterns:
         ("Operation cancelled by user", "operation_cancelled"),
         ("Database is busy", "database_busy"),
         ("Something went wrong", "unknown"),
+        (
+            "module 'win32com.gen_py.4AFFC9A0-5F99-101B-AF4E-00AA003F0F07x0x9x0' "
+            "has no attribute 'CLSIDToClassMap'",
+            "gen_py_cache",
+        ),
     ])
     def test_pattern_extraction(self, error, expected):
         assert _extract_error_pattern(error) == expected

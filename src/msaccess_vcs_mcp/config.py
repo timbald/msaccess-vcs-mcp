@@ -528,8 +528,7 @@ def validate_access_installation() -> None:
         RuntimeError: If Access COM automation is not available
     """
     try:
-        import win32com.client
-        from win32com.client import gencache
+        from .access_com.connection import ensure_dispatch
     except ImportError:
         raise ImportError(
             "pywin32 is required for Access COM automation. "
@@ -543,7 +542,7 @@ def validate_access_installation() -> None:
         # Deliberately left hidden, unlike instances that hold a database: no
         # database is opened here and the instance is quit immediately, so a
         # window would only flash on screen with nothing to act on.
-        app = gencache.EnsureDispatch("Access.Application")
+        app = ensure_dispatch("Access.Application")
         
         # Check if this is the user's instance (has a database open)
         # If so, do NOT quit - we'd close their work!

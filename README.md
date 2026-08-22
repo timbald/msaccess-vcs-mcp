@@ -41,6 +41,8 @@ When a tool needs Access, the window is shown rather than kept hidden — expect
 - **Python**: 3.10 or higher
 - **Microsoft Access**: Installed on Windows (for COM automation)
 - **pywin32**: Python COM interface (installed automatically)
+
+If MCP startup fails with a `CLSIDToClassMap` / `win32com.gen_py` error, the server deletes the stale type-library folder under `%TEMP%\gen_py` and retries once automatically. If it still fails after that, Microsoft Access is probably not installed or not registered for COM automation.
 - **MSAccess VCS Add-in**: Must be installed ([download latest release](https://github.com/joyfullservice/msaccess-vcs-integration/releases/latest))
 
 ## Getting Started

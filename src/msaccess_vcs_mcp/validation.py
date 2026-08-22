@@ -11,13 +11,16 @@ import os
 from typing import Any
 
 from . import __version__
-from .access_com.connection import ensure_access_visible, open_current_database
+from .access_com.connection import (
+    ensure_access_visible,
+    ensure_dispatch,
+    open_current_database,
+)
 from .addin_integration import VCSAddinIntegration, get_access_info
 from .config import get_config
 
 try:
     import win32com.client
-    from win32com.client import gencache
     COM_AVAILABLE = True
 except ImportError:
     COM_AVAILABLE = False
@@ -147,17 +150,17 @@ def validate_components(load_addin: bool = True) -> dict[str, Any]:
             except Exception:
                 # Database not open in any Access instance - create our own instance
                 # Use EnsureDispatch for early binding (fixes Application.Run issues)
-                app = gencache.EnsureDispatch("Access.Application")
+                app = ensure_dispatch("Access.Application")
                 owns_app = True
                 db_was_already_open = False
         else:
             # No target database configured, just create/get Access instance
             # Use EnsureDispatch for early binding (fixes Application.Run issues)
             try:
-                app = gencache.EnsureDispatch("Access.Application")
+                app = ensure_dispatch("Access.Application")
                 owns_app = False
             except Exception:
-                app = gencache.EnsureDispatch("Access.Application")
+                app = ensure_dispatch("Access.Application")
                 owns_app = True
         
         # Get Access info

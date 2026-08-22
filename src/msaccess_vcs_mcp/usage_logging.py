@@ -583,6 +583,9 @@ def _extract_error_pattern(error: str) -> str:
     error_lower = error.lower()
 
     # COM / Access errors
+    if "clsidtoclassmap" in error_lower or "win32com.gen_py." in error_lower:
+        return "gen_py_cache"
+
     if "com_error" in error_lower or "pywintypes.com_error" in error_lower:
         return "com_error"
 

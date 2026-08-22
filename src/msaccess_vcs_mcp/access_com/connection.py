@@ -12,6 +12,7 @@ Key Complexity Areas:
 
 import os
 import re
+import shutil
 import sys
 from typing import Any
 
@@ -21,6 +22,97 @@ try:
     COM_AVAILABLE = True
 except ImportError:
     COM_AVAILABLE = False
+
+_GEN_PY_MODULE_RE = re.compile(r"win32com\.gen_py\.([^\s'\"]+)")
+
+
+def _extract_gen_py_folder_from_error(message: str) -> str | None:
+    """Return the gen_py type-library folder name embedded in an error message."""
+    match = _GEN_PY_MODULE_RE.search(message)
+    return match.group(1) if match else None
+
+
+def _gen_py_folder_incomplete(folder_name: str) -> bool:
+    """True when a gen_py folder exists but lacks the wrapper package files."""
+    if not COM_AVAILABLE:
+        return False
+    folder_path = os.path.join(gencache.GetGeneratePath(), folder_name)
+    if not os.path.isdir(folder_path):
+        return False
+    return not os.path.isfile(os.path.join(folder_path, "__init__.py"))
+
+
+def _should_heal_gen_py_cache(exc: BaseException) -> bool:
+    """Detect a stale pywin32 gen_py wrapper that can be rebuilt safely."""
+    if not isinstance(exc, AttributeError):
+        return False
+    message = str(exc)
+    if "win32com.gen_py." not in message:
+        return False
+    if "CLSIDToClassMap" in message:
+        return True
+    folder = _extract_gen_py_folder_from_error(message)
+    return bool(folder and _gen_py_folder_incomplete(folder))
+
+
+def _purge_gen_py_cache_folder(folder_name: str, *, prog_id: str) -> None:
+    """Delete one corrupted gen_py type-library folder and drop cached imports."""
+    from ..usage_logging import log_diagnostic_event
+
+    folder_path = os.path.join(gencache.GetGeneratePath(), folder_name)
+    removed = False
+    if os.path.isdir(folder_path):
+        shutil.rmtree(folder_path, ignore_errors=True)
+        removed = True
+
+    module_prefix = f"win32com.gen_py.{folder_name}"
+    for name in list(sys.modules):
+        if name == module_prefix or name.startswith(f"{module_prefix}."):
+            del sys.modules[name]
+
+    try:
+        gencache.Rebuild()
+    except Exception:
+        pass
+
+    log_diagnostic_event(
+        "gen_py_cache_rebuilt",
+        prog_id=prog_id,
+        folder=folder_name,
+        path=folder_path,
+        removed=removed,
+    )
+    print(
+        f"Rebuilt pywin32 gen_py cache for {prog_id} "
+        f"(removed stale folder {folder_name})",
+        file=sys.stderr,
+    )
+
+
+def ensure_dispatch(prog_id: str):
+    """Early-bound COM dispatch with one-shot gen_py cache self-heal.
+
+    ``gencache.EnsureDispatch`` can fail when a type-library folder under
+    ``%TEMP%\\gen_py`` is left in a half-built state (for example only
+    ``__pycache__`` remains).  Delete that folder, rebuild the cache, and
+    retry once so MCP startup does not die on a recoverable local error.
+    """
+    if not COM_AVAILABLE:
+        raise ImportError(
+            "pywin32 is required for COM automation. "
+            "Install it with: pip install pywin32"
+        )
+
+    for attempt in range(2):
+        try:
+            return gencache.EnsureDispatch(prog_id)
+        except AttributeError as exc:
+            if attempt == 0 and _should_heal_gen_py_cache(exc):
+                folder = _extract_gen_py_folder_from_error(str(exc))
+                if folder:
+                    _purge_gen_py_cache_folder(folder, prog_id=prog_id)
+                    continue
+            raise
 
 
 def _paths_match(a: str, b: str) -> bool:
@@ -211,7 +303,7 @@ class AccessConnection:
         We must check whether the returned instance already has a
         database open to set _owns_app correctly.
         """
-        app = gencache.EnsureDispatch("Access.Application")
+        app = ensure_dispatch("Access.Application")
 
         try:
             existing_db = app.CurrentDb()
