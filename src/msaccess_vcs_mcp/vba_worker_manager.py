@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -31,6 +32,50 @@ from .usage_logging import (
 DEFAULT_RUN_VBA_TIMEOUT_SEC = 45.0
 DEFAULT_CALL_VBA_TIMEOUT_SEC = 45.0
 DEFAULT_RECOVERY_PROBE_TIMEOUT_SEC = 10.0
+
+
+def _reset_failure(error: str) -> dict[str, Any]:
+    """Build a fail-closed reset result for the public tool response."""
+    return {
+        "success": False,
+        "resetQueued": False,
+        "error": error,
+        "error_pattern": "reset_failed",
+        "phase": "reset_state",
+    }
+
+
+def _parse_reset_result(raw_result: Any) -> dict[str, Any]:
+    """Parse and validate the add-in's pre-RunVBA reset response."""
+    if not isinstance(raw_result, str):
+        return _reset_failure(
+            "ResetVbaProjectState returned a non-JSON response."
+        )
+
+    try:
+        result = json.loads(raw_result)
+    except (TypeError, json.JSONDecodeError) as exc:
+        return _reset_failure(
+            f"ResetVbaProjectState returned invalid JSON: {exc}"
+        )
+
+    if not isinstance(result, dict):
+        return _reset_failure(
+            "ResetVbaProjectState returned JSON that was not an object."
+        )
+
+    result.setdefault("phase", "reset_state")
+    if result.get("success") is True and result.get("resetQueued") is True:
+        return result
+
+    result["success"] = False
+    result["resetQueued"] = False
+    result.setdefault(
+        "error",
+        "ResetVbaProjectState did not confirm that the reset was queued.",
+    )
+    result.setdefault("error_pattern", "reset_failed")
+    return result
 
 
 def _read_timeout_env(name: str, default: float) -> float:
@@ -322,12 +367,24 @@ class VBAWorkerManager:
 
         def worker() -> None:
             phase = "start"
+
+            def set_phase(next_phase: str) -> None:
+                nonlocal phase
+                phase = next_phase
+                log_diagnostic_event(
+                    "vba_worker_phase",
+                    database=str(database_path),
+                    operation=operation,
+                    phase=phase,
+                    retry=retry,
+                )
+
             try:
                 if not COM_AVAILABLE:
                     raise ImportError("pywin32 is required for COM automation")
                 pythoncom.CoInitialize()
                 try:
-                    phase = "connect"
+                    set_phase("connect")
                     worker_app = VCSAddinIntegration._find_access_in_rot(database_path)
                     if worker_app is None:
                         raise RuntimeError(
@@ -339,7 +396,7 @@ class VBAWorkerManager:
                     # both are only recoverable in a window someone can see.
                     ensure_access_visible(worker_app)
 
-                    phase = "load_addin"
+                    set_phase("load_addin")
                     addin = VCSAddinIntegration(addin_path)
                     addin.load_addin(worker_app, db_path=database_path)
 
@@ -352,7 +409,63 @@ class VBAWorkerManager:
                         }
                         return
 
-                    phase = "run_vba"
+                    set_phase("reset_state")
+                    reset_result = _parse_reset_result(
+                        addin.call_sync("ResetVbaProjectState")
+                    )
+                    if not reset_result.get("success"):
+                        log_diagnostic_event(
+                            "vba_worker_reset_failed",
+                            database=str(database_path),
+                            operation=operation,
+                            phase=phase,
+                            error=reset_result.get("error"),
+                            error_pattern=reset_result.get("error_pattern"),
+                            retry=retry,
+                        )
+                        result_box["result"] = {
+                            # The COM round trip completed. Return the add-in's
+                            # logical failure through the normal JSON channel.
+                            "success": True,
+                            "operation": operation,
+                            "phase": phase,
+                            "result": json.dumps(reset_result),
+                        }
+                        return
+
+                    set_phase("reset_barrier")
+                    try:
+                        # A built-in COM property read gives the queued VBE
+                        # teardown a safe message pump with no host VBA payload
+                        # running beneath it.
+                        _ = worker_app.CurrentProject.FullName
+                    except Exception as barrier_error:
+                        log_diagnostic_event(
+                            "vba_worker_reset_barrier_retry",
+                            database=str(database_path),
+                            operation=operation,
+                            phase=phase,
+                            error=str(barrier_error),
+                            error_pattern=classify_com_error(barrier_error),
+                            retry=retry,
+                        )
+
+                    # Never carry pre-reset COM proxies into payload execution.
+                    addin = None
+                    worker_app = VCSAddinIntegration._find_access_in_rot(database_path)
+                    if worker_app is None:
+                        raise RuntimeError(
+                            f"Cannot reacquire Access instance for {database_path} "
+                            "after resetting the VBA project."
+                        )
+                    _ = worker_app.CurrentProject.FullName
+                    ensure_access_visible(worker_app)
+
+                    set_phase("reacquire_addin")
+                    addin = VCSAddinIntegration(addin_path)
+                    addin.load_addin(worker_app, db_path=database_path)
+
+                    set_phase("run_vba")
                     vba_result = addin.call_sync("RunVBA", code)
                     result_box["result"] = {
                         "success": True,

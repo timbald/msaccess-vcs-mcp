@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 from unittest.mock import Mock, patch
@@ -10,8 +11,9 @@ from unittest.mock import Mock, patch
 import pytest
 
 import msaccess_vcs_mcp.tools as tools_module
+import msaccess_vcs_mcp.vba_worker_manager as worker_module
 from msaccess_vcs_mcp.com_recovery import classify_com_error, get_recovery_manager
-from msaccess_vcs_mcp.vba_worker_manager import VBAWorkerManager
+from msaccess_vcs_mcp.vba_worker_manager import VBAWorkerManager, _parse_reset_result
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +63,74 @@ def _patch_worker_thread(monkeypatch, results: list[dict]):
     return call_log
 
 
+def _install_fake_com_worker(
+    monkeypatch,
+    *,
+    reset_response: str,
+    initial_barrier_error: Exception | None = None,
+    fresh_barrier_error: Exception | None = None,
+):
+    """Install deterministic COM/add-in doubles for the real worker body."""
+    events: list[str] = []
+
+    class FakeProject:
+        def __init__(self, label: str, error: Exception | None = None):
+            self.label = label
+            self.error = error
+
+        @property
+        def FullName(self):
+            events.append(f"barrier:{self.label}")
+            if self.error is not None:
+                raise self.error
+            return "C:\\db.accdb"
+
+    class FakeApp:
+        def __init__(self, label: str, error: Exception | None = None):
+            self.label = label
+            self.CurrentProject = FakeProject(label, error)
+
+    initial_app = FakeApp("initial", initial_barrier_error)
+    fresh_app = FakeApp("fresh", fresh_barrier_error)
+    find_count = 0
+
+    class FakeIntegration:
+        def __init__(self, addin_path=None):
+            self.label = ""
+
+        @staticmethod
+        def _find_access_in_rot(database_path):
+            nonlocal find_count
+            find_count += 1
+            label = "initial" if find_count == 1 else "fresh"
+            events.append(f"find:{label}")
+            return initial_app if find_count == 1 else fresh_app
+
+        def load_addin(self, app, db_path=None):
+            self.label = app.label
+            events.append(f"load:{self.label}")
+            return True
+
+        def call_sync(self, command, *args):
+            events.append(f"call:{self.label}:{command}")
+            if command == "ResetVbaProjectState":
+                return reset_response
+            if command == "RunVBA":
+                return '{"success": true, "result": "ok"}'
+            raise AssertionError(f"Unexpected command: {command}")
+
+    fake_pythoncom = Mock()
+    monkeypatch.setattr(worker_module, "COM_AVAILABLE", True)
+    monkeypatch.setattr(worker_module, "pythoncom", fake_pythoncom)
+    monkeypatch.setattr(worker_module, "VCSAddinIntegration", FakeIntegration)
+    monkeypatch.setattr(
+        worker_module,
+        "ensure_access_visible",
+        lambda app: events.append(f"visible:{app.label}"),
+    )
+    return events
+
+
 # ------------------------------------------------------------------
 # COM error classification (unchanged)
 # ------------------------------------------------------------------
@@ -100,6 +170,127 @@ def test_run_vba_success(monkeypatch):
     assert result["result"] == '{"success": true, "result": 42}'
     assert calls[0]["operation"] == "run_vba"
     assert calls[0]["code"] == "MCP_TempFunction = 42"
+
+
+def test_real_worker_orders_reset_barrier_reacquire_then_run(monkeypatch):
+    events = _install_fake_com_worker(
+        monkeypatch,
+        reset_response='{"success": true, "resetQueued": true}',
+    )
+
+    result = VBAWorkerManager()._run_worker(
+        operation="run_vba",
+        database_path="C:\\db.accdb",
+        addin_path="C:\\addin.accda",
+        code='MCP_TempFunction = "ok"',
+        timeout_seconds=1,
+    )
+
+    assert result["success"] is True
+    assert result["phase"] == "run_vba"
+    assert result["result"] == '{"success": true, "result": "ok"}'
+    assert events == [
+        "find:initial",
+        "visible:initial",
+        "load:initial",
+        "call:initial:ResetVbaProjectState",
+        "barrier:initial",
+        "find:fresh",
+        "barrier:fresh",
+        "visible:fresh",
+        "load:fresh",
+        "call:fresh:RunVBA",
+    ]
+
+
+@pytest.mark.parametrize(
+    "reset_response,error_pattern",
+    [
+        (
+            '{"success": false, "resetQueued": false, '
+            '"error": "unsafe", "error_pattern": "reset_refused"}',
+            "reset_refused",
+        ),
+        (
+            '{"success": false, "resetQueued": false, '
+            '"error": "failed", "error_pattern": "reset_failed"}',
+            "reset_failed",
+        ),
+        ('{"success": true}', "reset_failed"),
+        ("not json", "reset_failed"),
+    ],
+)
+def test_real_worker_fails_closed_when_reset_is_not_confirmed(
+    monkeypatch, reset_response, error_pattern
+):
+    events = _install_fake_com_worker(
+        monkeypatch,
+        reset_response=reset_response,
+    )
+
+    result = VBAWorkerManager()._run_worker(
+        operation="run_vba",
+        database_path="C:\\db.accdb",
+        addin_path="C:\\addin.accda",
+        code='MCP_TempFunction = "must not run"',
+        timeout_seconds=1,
+    )
+
+    logical_result = json.loads(result["result"])
+    assert result["success"] is True  # COM succeeded; logical failure is JSON.
+    assert logical_result["success"] is False
+    assert logical_result["error_pattern"] == error_pattern
+    assert not any(event.endswith(":RunVBA") for event in events)
+    assert not any(event.startswith("barrier:") for event in events)
+
+
+def test_real_worker_reacquires_after_initial_barrier_error(monkeypatch):
+    events = _install_fake_com_worker(
+        monkeypatch,
+        reset_response='{"success": true, "resetQueued": true}',
+        initial_barrier_error=RuntimeError("reset teardown in progress"),
+    )
+
+    result = VBAWorkerManager()._run_worker(
+        operation="run_vba",
+        database_path="C:\\db.accdb",
+        addin_path="C:\\addin.accda",
+        code='MCP_TempFunction = "ok"',
+        timeout_seconds=1,
+    )
+
+    assert result["success"] is True
+    assert "barrier:initial" in events
+    assert "barrier:fresh" in events
+    assert events[-1] == "call:fresh:RunVBA"
+
+
+def test_real_worker_stops_when_fresh_barrier_fails(monkeypatch):
+    events = _install_fake_com_worker(
+        monkeypatch,
+        reset_response='{"success": true, "resetQueued": true}',
+        fresh_barrier_error=RuntimeError("Access still resetting"),
+    )
+
+    result = VBAWorkerManager()._run_worker(
+        operation="run_vba",
+        database_path="C:\\db.accdb",
+        addin_path="C:\\addin.accda",
+        code='MCP_TempFunction = "must not run"',
+        timeout_seconds=1,
+    )
+
+    assert result["success"] is False
+    assert result["phase"] == "reset_barrier"
+    assert not any(event.endswith(":RunVBA") for event in events)
+
+
+def test_parse_reset_result_rejects_non_object_json():
+    result = _parse_reset_result('["not", "an", "object"]')
+
+    assert result["success"] is False
+    assert result["resetQueued"] is False
+    assert result["error_pattern"] == "reset_failed"
 
 
 # ------------------------------------------------------------------
@@ -297,3 +488,52 @@ def test_vcs_run_vba_preserves_json_result_semantics(tmp_path, monkeypatch):
     )
 
     assert result == {"success": True, "result": 7}
+
+
+def test_vcs_run_vba_preserves_cleanup_diagnostics(tmp_path, monkeypatch):
+    db_path = tmp_path / "test.accdb"
+    db_path.write_text("", encoding="utf-8")
+
+    async def fake_ensure(ctx):
+        return None
+
+    monkeypatch.setenv("ACCESS_VCS_ENABLE_LOGGING", "false")
+    monkeypatch.setattr(tools_module, "_ensure_env_loaded", fake_ensure)
+    monkeypatch.setattr(tools_module.mcp, "get_context", lambda: None)
+    monkeypatch.setattr(tools_module, "load_config", lambda: {})
+    monkeypatch.setattr(
+        tools_module,
+        "get_config",
+        lambda: {"ACCESS_VCS_ADDIN_PATH": "C:\\addin.accda"},
+    )
+    monkeypatch.setattr(
+        tools_module,
+        "run_vba_resilient",
+        lambda **kwargs: {
+            "success": True,
+            "result": json.dumps(
+                {
+                    "success": False,
+                    "error_pattern": "temp_module_cleanup_failed",
+                    "cleanupFailed": True,
+                    "orphanModule": "MCP_Temp_123",
+                    "payloadResult": "done",
+                }
+            ),
+        },
+    )
+
+    result = asyncio.run(
+        tools_module.vcs_run_vba(
+            database_path=str(db_path),
+            code='MCP_TempFunction = "done"',
+        )
+    )
+
+    assert result == {
+        "success": False,
+        "error_pattern": "temp_module_cleanup_failed",
+        "cleanupFailed": True,
+        "orphanModule": "MCP_Temp_123",
+        "payloadResult": "done",
+    }

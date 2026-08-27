@@ -2264,6 +2264,26 @@ def vcs_run_vba(
     
     **Requires McpAllowRunVBA option to be enabled** (default: off).
     The user must enable this manually in the VCS Options form.
+
+    **Reset and temporary-module recovery:**
+    Before creating the wrapper, the worker queues a host-project VBA reset
+    in a separate API call, runs a harmless COM message-pump barrier, and
+    reacquires its Access references. A reset refusal or failure is fail-closed:
+    the submitted code does not run.
+
+    The add-in sweeps stale `MCP_Temp_*` standard modules before creating the
+    wrapper. Recovery and cleanup fields are actionable:
+      - `sweptModules`: stale modules removed before the payload
+      - `temp_module_sweep_failed` + `orphanModules`: stale modules remain;
+        payload not started
+      - `temp_module_unresolvable` + `tempModule`: post-compile canary failed;
+        payload not started
+      - `temp_module_cleanup_failed` + `cleanupFailed` + `orphanModule`:
+        wrapper survived cleanup; a completed return is preserved as
+        `payloadResult`
+
+    Stop and tell the user when cleanup fails rather than repeatedly issuing
+    calls against a project with an orphaned wrapper.
     
     The agent's code should set the function return value via the
     MCP_TempFunction identifier. Example:
@@ -2319,8 +2339,10 @@ def vcs_run_vba(
     
     Returns:
         Dictionary with `success`, `result`, and on failure `error`,
-        `errorNumber`, and `errorLine` (the 1-based line in `code` that
-        raised the captured error; omitted when not available).
+        `error_pattern`, `errorNumber`, and `errorLine` (the 1-based line
+        in `code` that raised the captured error; omitted when not
+        available). Reset, sweep, canary, and cleanup failures include the
+        actionable fields described above.
     """
     try:
         db_path = validate_database_path(database_path)
