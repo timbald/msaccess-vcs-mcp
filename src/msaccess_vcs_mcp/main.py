@@ -85,6 +85,8 @@ def _stop_callback_server() -> None:
 
 def _cleanup_session() -> None:
     """End the MCP session on server shutdown, cleaning up override files."""
+    if os.environ.get("ACCESS_VCS_SKIP_SESSION_CLEANUP", "").lower() == "true":
+        return
     session_id = os.environ.get("ACCESS_VCS_SESSION_ID")
     db_path = os.environ.get("ACCESS_VCS_DATABASE")
     if not session_id or not db_path:

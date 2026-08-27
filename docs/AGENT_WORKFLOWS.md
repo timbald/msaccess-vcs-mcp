@@ -240,31 +240,50 @@ print(f"Built database contains {len(objects['queries'])} queries")
 
 **Use case:** You edited add-in source (for example `clsQueryComposer.cls`) and need the running add-in to pick up those changes without waiting for a person.
 
-This is **not** `vcs_rebuild_database`. That tool rebuilds a user project. The add-in rebuilds itself through `VCS.RebuildAddIn`.
+This is **not** `vcs_rebuild_database`. That tool rebuilds a user project. The add-in rebuilds itself through `vcs_rebuild_addin`.
 
 **Preconditions:** no other `MSACCESS.EXE` in the Windows session may hold a file the rebuild replaces — the installed add-in or the build target. An instance with an unrelated database open does not block it; one that loaded the add-in does, as does one that cannot be asked. The guard reports them but closes nothing. The repo folder must be a trusted location and the helper script enabled.
 
 **Steps:**
 ```python
-result = vcs_call_vba(
-    r"C:\path\to\msaccess-vcs-addin\Version Control.accda",
-    "VCS.API",
-    ["RebuildAddIn", r"C:\path\to\msaccess-vcs-addin\Version Control.accda.src"],
+result = vcs_rebuild_addin(
+    r"C:\path\to\msaccess-vcs-addin\Version Control.accda.src"
 )
-# Parse result["result"] for status and statusFile. Access quits a few seconds later.
-# On "launched", poll <source>/logs/rebuild-status.json until complete or *-failed,
-# matching phaseStarted against result["rebuild_phase_started"].
+# Returns when this attempt is complete, refused, or *-failed.
+# Do not poll rebuild-status.json yourself unless the tool timed out.
 ```
 
-The first argument only picks the host Access instance — the source folder decides the rebuild. Host it on the development copy of the add-in in its repository, the `Version Control.accda` beside the source folder: rebuilding the add-in is a repository operation and belongs to the repository's own copy, which closes itself once the worker handoff is confirmed. Do not open a user database, anything in the repository's `Testing` folder, or a scratch `.accdb` to satisfy the parameter. The installed add-in is refused here as it is for every tool — see the note under 6c.
+The tool derives the development copy beside the source folder. Its callback
+URL and operation ID cross the disconnected worker boundary, so the builder
+Access process emits the same detailed HTTP `Log.Add` / `Log.Progress` stream
+as `vcs_rebuild_database`. The status file remains authoritative for compile,
+install, terminal failure, and recovery after the builder exits. Rebuilding
+the add-in is a repository operation and belongs to the repository's own copy,
+which closes itself once the worker handoff is confirmed. Do not open a user
+database, anything in the repository's `Testing` folder, or a scratch `.accdb`.
+The installed add-in is refused here as it is for every tool — see the note
+under 6c.
+
+MCP progress is best-effort in Cursor 3.13. For live terminal output:
+
+```text
+msaccess-vcs rebuild-addin "C:\path\to\msaccess-vcs-addin\Version Control.accda.src"
+```
+
+Keep the CLI in the foreground so its stream stays in the primary chat. It
+exits when the operation reaches terminal status; that process exit is the
+completion signal. Do not background it just to wait on a notification, and
+do not add a second timer wait, fixed-duration sleep, or
+`rebuild-status.json` poll after it has already finished.
 
 **Tips:**
-- Only `launched` is worth polling; `refused` and `launch-failed` are terminal in the call's own JSON
-- A `refused` result lists each other process in `otherInstances` with what was observed about it; close those yourself and call again
+- `refused` and `launch-failed` come back immediately; nothing was rebuilt
+- A `refused` result lists each other process in `otherInstances`; close those yourself and call again
 - `launch-failed` means the helper script never started — Access stays open and the call is safe to retry
 - `compile-failed` leaves Access open on the rebuilt file for Debug > Compile
 - After `complete`, later MCP calls load the newly installed add-in
-- A status that stops advancing is a stalled run, not a slow one; check `Get-Process MSACCESS,wscript` before waiting longer
+- `vcs_call_vba(..., ["RebuildAddIn", source])` is a launch-only escape hatch
+- If the tool times out, recover by reading `<source>/logs/rebuild-status.json` and matching `phaseStarted`
 
 ### 6c. Run the add-in's own test suite
 

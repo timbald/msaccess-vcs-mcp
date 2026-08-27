@@ -17,6 +17,76 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 
+class MonotonicProgressReporter:
+    """Emit MCP ``notifications/progress`` with a strictly increasing sequence.
+
+    VBA progress is scoped per category and resets (for example 28/30 queries
+    then 1/50 modules). The MCP spec requires each notification's ``progress``
+    value to increase, so this adapter owns the sequence and keeps VBA's
+    current/total in the human-readable message instead.
+    """
+
+    def __init__(self) -> None:
+        self._last: float = 0.0
+        self._lock = asyncio.Lock()
+
+    @property
+    def last(self) -> float:
+        return self._last
+
+    @staticmethod
+    def format_message(
+        message: str = "",
+        vba_progress: Any = None,
+        vba_total: Any = None,
+    ) -> str:
+        display = message or ""
+        progress = MonotonicProgressReporter._as_count(vba_progress)
+        if progress is None or progress < 0:
+            return display
+        total = MonotonicProgressReporter._as_count(vba_total)
+        if total is None or total in (0, -1):
+            suffix = f"({progress:g})"
+        else:
+            suffix = f"({progress:g}/{total:g})"
+        return f"{display} {suffix}".strip() if display else suffix
+
+    @staticmethod
+    def _as_count(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return float(value)
+            except ValueError:
+                return None
+        return None
+
+    async def emit(
+        self,
+        ctx: Any,
+        *,
+        message: str = "",
+        vba_progress: Any = None,
+        vba_total: Any = None,
+    ) -> None:
+        async with self._lock:
+            self._last += 1.0
+            display = self.format_message(message, vba_progress, vba_total)
+            if not ctx or not hasattr(ctx, "report_progress"):
+                return
+            try:
+                await ctx.report_progress(
+                    progress=self._last,
+                    total=None,
+                    message=display or None,
+                )
+            except Exception as e:
+                logger.debug(f"Could not report progress: {e}")
+
+
 @dataclass
 class PendingOperation:
     """Represents a pending async operation."""
@@ -325,6 +395,7 @@ class OperationManager:
         
         # Collect log messages to include in result
         log_messages: list[str] = []
+        reporter = MonotonicProgressReporter()
         
         try:
             async with asyncio.timeout(timeout):
@@ -337,32 +408,21 @@ class OperationManager:
                     message = callback.get("message", "")
                     
                     if msg_type == "progress":
-                        # Report progress to MCP context if available
-                        if ctx and hasattr(ctx, "report_progress"):
-                            try:
-                                await ctx.report_progress(
-                                    progress=progress or 0,
-                                    total=total,
-                                    message=message
-                                )
-                            except Exception as e:
-                                logger.debug(f"Could not report progress: {e}")
+                        await reporter.emit(
+                            ctx,
+                            message=message,
+                            vba_progress=progress,
+                            vba_total=total,
+                        )
                         logger.debug(f"Progress: {progress}/{total} - {message}")
                         
                     elif msg_type == "log":
-                        # Log message from VBA - report progress and collect for result
+                        # Log message from VBA - collect for the result and
+                        # surface via monotonic progress (MCP logging notifications
+                        # are deprecated).
                         if message:
                             log_messages.append(message)
-                            # Report to MCP context for real-time display
-                            if ctx and hasattr(ctx, "report_progress"):
-                                try:
-                                    await ctx.report_progress(
-                                        progress=len(log_messages),
-                                        total=0,  # Unknown total
-                                        message=message
-                                    )
-                                except Exception:
-                                    pass
+                            await reporter.emit(ctx, message=message)
                         logger.info(f"VBA log: {message}")
                         
                     elif msg_type == "complete":

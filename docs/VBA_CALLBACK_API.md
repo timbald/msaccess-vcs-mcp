@@ -210,6 +210,25 @@ End Function
 }
 ```
 
+VBA may reset `progress`/`total` at each category (28/30 queries, then 1/50 modules). The MCP server does **not** forward those values as MCP `progress`/`total`. It emits a strictly increasing sequence and keeps the VBA counts in the human-readable message. Log callbacks use the same reporter. Deprecated MCP logging notifications (`notifications/message`) are not used. The final tool result still includes `log_messages` and `log_path`.
+
+Cursor 3.13 often shows only "Running..." for those notifications. The `msaccess-vcs` CLI prints each update to stdout as it arrives.
+
+### Add-in self-rebuild
+
+`vcs_rebuild_addin` registers an ordinary callback operation before calling
+`RebuildAddIn`. The launching Access instance parses the callback info and
+passes the URL, operation ID, and original `phaseStarted` through `Worker.vbs`.
+The builder Access instance reconstructs the callback JSON and invokes
+`APIAsync(..., "Build", source_dir)`, so existing `Log.Add` and `Log.Progress`
+messages stream without a second logging implementation.
+
+The build's `complete` callback ends only the build-phase callback pump. The
+worker must still compile and install after that Access instance exits, so
+`rebuild-status.json` remains authoritative for `compiling`, `installing`,
+`complete`, and terminal failures. All callback and status messages share one
+monotonic MCP reporter.
+
 ### Log Callback
 
 ```json

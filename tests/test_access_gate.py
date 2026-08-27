@@ -136,6 +136,7 @@ def test_exempt_tools_include_status_queries():
     assert "vcs_get_version_info" in EXEMPT_TOOLS
     assert "vcs_get_recent_calls" in EXEMPT_TOOLS
     assert "vcs_cancel_operation" in EXEMPT_TOOLS
+    assert "vcs_rebuild_addin" in EXEMPT_TOOLS
 
 
 def test_com_initializer_runs_for_sync_work():

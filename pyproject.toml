@@ -43,6 +43,7 @@ dev = [
 
 [project.scripts]
 msaccess-vcs-mcp = "msaccess_vcs_mcp.main:main"
+msaccess-vcs = "msaccess_vcs_mcp.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

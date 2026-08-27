@@ -74,6 +74,72 @@ contradictory guidance.
 
 ---
 
+## 2026-08-27 — Carry the existing HTTP stream through add-in self-rebuild
+
+**Trigger**: The first `vcs_rebuild_addin` smoke test completed in Access but
+showed only "Rebuild launched" and then hung. Even without the hang, watching
+the coarse status file could report only `building`, `compiling`, and
+`installing`, while the build log contained the useful per-object detail.
+
+**Options explored**:
+- *Tail `Build_*.log` from Python.* Viable fallback, but duplicates the stream
+  already emitted by `Log.Add` and `Log.Progress`, requires discovering a
+  timestamped file, and cannot preserve native progress values.
+- *Have Worker.vbs implement HTTP posting.* Rejected. That would be a second
+  callback implementation and a second formatter.
+- *Pass the existing callback identity to builder Access* (chosen). The parent
+  callback server outlives the launching Access instance, and the builder can
+  invoke the existing `APIAsync(..., "Build", source)` path.
+
+**Decision**: `vcs_rebuild_addin` registers an operation before launch and
+passes its callback JSON as the second `RebuildAddIn` argument. The add-in
+extracts the shell-safe URL and operation ID, carries them through Worker.vbs,
+and reconstructs the callback JSON in builder Access. Build `log`, `progress`,
+and terminal callbacks feed the same monotonic reporter as status phases. A
+build `complete` callback ends only the callback pump; the status watcher
+remains authoritative for compile/install and the final result. The original
+`phaseStarted` now also crosses the worker boundary instead of being replaced.
+`ReadDirectoryChangesW` uses overlapped I/O and `CancelIo`, avoiding the
+deadlock caused by closing a handle with a synchronous read on another thread.
+
+**What this rules out**: Tailing the build log as the primary live channel.
+Reimplementing HTTP in Worker.vbs. Treating the build-phase `complete` callback
+as proof that compile/install finished. Replacing durable terminal status with
+an ephemeral callback.
+
+**Relevant files**: `src/msaccess_vcs_mcp/tools.py`,
+`operation_manager.py`, `rebuild_watcher.py`, `cli.py`,
+`tests/test_rebuild_watcher.py`; add-in `clsVersionControl.cls` and
+`clsWorker.cls`.
+
+---
+
+## 2026-08-27 — Real-time operation feedback: monotonic MCP progress, rebuild watcher, CLI
+
+> **⚠ Partially superseded** (2026-08-27): builder HTTP callbacks now cross
+> the disconnected worker boundary. The status watcher remains for
+> compile/install and durable recovery, but is no longer the only live source.
+> See "Carry the existing HTTP stream through add-in self-rebuild" above.
+
+**Trigger**: Long Access operations looked idle in Cursor. VBA progress resets per category, so forwarding `current/total` as MCP `progress` violated the strictly-increasing rule. Full merge and database rebuild also dropped the MCP context (`ctx=None`). Add-in self-rebuild still required the agent to poll `rebuild-status.json` after `vcs_call_vba` returned. Cursor 3.13 often shows only "Running..." for progress notifications.
+
+**Options explored**:
+- *Forward VBA `current/total` as MCP progress.* Rejected. The spec requires each notification's `progress` to increase; category resets (28/30 queries, then 1/50 modules) are invalid and clients drop them.
+- *MCP logging notifications (`ctx.log`).* Rejected. Deprecated 2026-07-28 / SEP-2577.
+- *MCP Tasks.* Rejected. Extra protocol surface; does not fix Cursor display.
+- *Have the add-in worker POST HTTP callbacks after Access quits.* Deferred. Would need a new worker contract; `rebuild-status.json` is already the durable source of truth.
+- *New `vcs_rebuild_addin` that blocks on COM.* Rejected again. The host Access instance must quit so files can be replaced.
+- *Agent-side Read polling of the status file.* Rejected as the normal workflow. Agents sat on timers after the work had finished.
+- *Dedicated CLI that reimplements COM.* Rejected. A second operation path would drift from the MCP tools.
+
+**Decision**: A shared `MonotonicProgressReporter` owns an incrementing sequence and keeps VBA counts in the message, with `total=None`. Full export, merge, and database rebuild all pass `ctx`. `vcs_rebuild_addin(source_dir)` launches via existing `RebuildAddIn` (gate held only for launch), then watches `rebuild-status.json` with `ReadDirectoryChangesW` (poll fallback), correlating `phaseStarted`. Cancel abandons the wait only — it does not kill `MSACCESS.EXE` or `wscript`. `vcs_call_vba` stays launch-only. `msaccess-vcs` is a stdio MCP client for the same tools, printing progress with immediate flush. Status-file polling remains recovery after a client timeout or stall.
+
+**What this rules out**: Treating Cursor chat progress as a keepalive or as guaranteed UI. Killing Access/wscript when a client stops waiting. Making generic `vcs_call_vba` wait minutes for install. Adopting deprecated MCP logging notifications. A second COM implementation beside the MCP server.
+
+**Relevant files**: `src/msaccess_vcs_mcp/operation_manager.py`, `rebuild_watcher.py`, `cli.py`, `tools.py` (`vcs_rebuild_addin`), `access_gate.py`, `tests/test_operation_manager.py`, `tests/test_rebuild_watcher.py`, `tests/test_cli.py`.
+
+---
+
 ## 2026-08-21 — Self-heal corrupted pywin32 gen_py cache
 
 **Trigger**: MCP startup died with `module 'win32com.gen_py.4AFFC9A0-...' has no attribute 'CLSIDToClassMap'` when `%TEMP%\gen_py` held a half-built Access type-library folder (only `__pycache__`, no wrapper `.py` files). Deleting the folder manually and retrying `EnsureDispatch` regenerated the wrappers and succeeded. The failure had recurred several times.
@@ -325,6 +391,13 @@ which would bypass the DAO fallback chain that predates this path.
 
 ## 2026-08-12 — Agentic add-in rebuild via existing vcs_call_vba
 
+> **⚠ Partially superseded** (2026-08-27): the normal agent path is now
+> `vcs_rebuild_addin`, which watches `rebuild-status.json` after launch. The
+> rejection of "a tool that waits on COM" still holds; the new tool waits on
+> the status file with the Access gate released. `vcs_call_vba` remains the
+> launch-only escape hatch. Agent-side Read polling is recovery, not the
+> primary workflow. See "Real-time operation feedback" above.
+>
 > **⚠ Partially superseded** (2026-08-21): the host is the development copy of
 > the add-in in its repository, not an arbitrary open database — see "The
 > installed add-in is never a target, for any tool" above. `vcs_call_vba` also has a timeout now

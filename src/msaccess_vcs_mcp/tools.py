@@ -64,6 +64,8 @@ from .usage_logging import (
     read_recent_tool_calls,
     with_logging,
 )
+from .rebuild_watcher import get_rebuild_timeout, wait_for_rebuild_status
+from .operation_manager import MonotonicProgressReporter
 from .vba_worker_manager import get_call_vba_timeout, run_vba_resilient
 
 _COMPILE_FAILURE_AGENT_GUIDANCE = (
@@ -258,33 +260,26 @@ mcp = FastMCP(
         "Set ACCESS_VCS_DISABLE_WRITES=true to prevent database modifications.\n\n"
         "**Rebuilding the VCS add-in:**\n"
         "To rebuild `Version Control.accda` from source after editing add-in files, "
-        "call vcs_call_vba(db, \"VCS.API\", [\"RebuildAddIn\", \"<source folder>\"]). "
-        "`db` only picks the Access instance that hosts the call; the source folder is what "
-        "decides the rebuild. Pass the **development copy** of the add-in from its "
-        "repository (the `Version Control.accda` beside the source folder). That host "
-        "holds the build target and closes itself once the handoff is confirmed. Do NOT "
-        "open a user database, anything in the repo's Testing folder, or a scratch "
-        "database to host this -- rebuilding the add-in is a repository operation and "
-        "belongs to the repository's own copy. "
-        "On `\"status\": \"launched\"`, poll `<source folder>/logs/rebuild-status.json` with "
-        "the Read tool until status is `complete` or `*-failed`. Match the file's "
-        "`phaseStarted` against the one the call returned — a different value is another "
-        "run's record, not yours. Access exits a few seconds "
-        "after the call returns, so a COM error on that call is possible.\n"
-        "`refused` and `launch-failed` are returned in the call's own JSON and mean nothing "
-        "was rebuilt, so there is nothing to poll for; an attempt that reached a valid "
-        "source folder also records its refusal in the status file. The rebuild refuses when another "
-        "MSACCESS.EXE in the Windows session holds one of the files it replaces, and never "
-        "closes another Access process. It checks the loaded VBA projects in each one, so an "
-        "instance with an unrelated database open does not block it; an instance that cannot "
-        "be asked does, since a busy instance cannot be told apart from an idle one. On "
-        "refusal, `otherInstances` names each process, what was observed about it, and which "
-        "file it holds; close those and call again. `launch-failed` means the helper script "
-        "never started: Access is left open and the call is safe to retry. A `launched` "
-        "result is confirmed -- the add-in waits for the worker to report in before returning "
-        "it -- so a status that then stops advancing is a stalled run, not a slow one. Check "
-        "`Get-Process MSACCESS,wscript`: a live rebuild always has at least one.\n"
-        "This is not vcs_rebuild_database, which rebuilds a user project.\n"
+        "call vcs_rebuild_addin(\"<source folder>\"). It derives the development copy "
+        "of the add-in (the `Version Control.accda` beside the source folder), launches "
+        "RebuildAddIn, and waits on `<source>/logs/rebuild-status.json` with filesystem "
+        "notifications until status is `complete` or `*-failed`. Do NOT open a user "
+        "database, anything in the repo's Testing folder, or a scratch database to host "
+        "this -- rebuilding the add-in is a repository operation and belongs to the "
+        "repository's own copy. Prefer this over polling the status file yourself.\n"
+        "`refused` and `launch-failed` are returned immediately and mean nothing was "
+        "rebuilt. The rebuild refuses when another MSACCESS.EXE in the Windows session "
+        "holds one of the files it replaces, and never closes another Access process. "
+        "On refusal, `otherInstances` names each process and which file it holds; close "
+        "those and call again. `launch-failed` means the helper script never started: "
+        "Access is left open and the call is safe to retry.\n"
+        "This is not vcs_rebuild_database, which rebuilds a user project. "
+        "vcs_call_vba(db, \"VCS.API\", [\"RebuildAddIn\", source]) remains a launch-only "
+        "escape hatch; it does not wait for the rebuild to finish.\n"
+        "MCP progress notifications are best-effort in Cursor: the server emits them, "
+        "but some Cursor builds show only \"Running...\" until the tool returns. For "
+        "live terminal output, run `msaccess-vcs rebuild-addin <source>` (or export / "
+        "merge / rebuild-database).\n"
         "After any MCP client timeout (`-32001`), call vcs_get_recent_calls() to learn "
         "what actually executed — the server may have finished after the client gave up.\n"
         "One server process is shared across Cursor windows. When another window holds the "
@@ -337,6 +332,8 @@ mcp = FastMCP(
         "— import a single object/type from source\n"
         "- vcs_rebuild_database(source_dir*, output_path*, template_path?) "
         "— build fresh database from source\n"
+        "- vcs_rebuild_addin(source_dir*, timeout_seconds?) "
+        "— rebuild the VCS add-in from source and wait for install\n"
         "- vcs_diff_database(database_path*, source_dir*, show_details?) "
         "— compare database against source files\n"
         "- vcs_run_vba(database_path*, code*, timeout_seconds?) "
@@ -1115,7 +1112,7 @@ async def vcs_import_objects(
                         timeout_ms = async_result.get("timeout_ms", 300000)
                         completion = await op_manager.wait_for_completion(
                             operation_id,
-                            ctx=None,
+                            ctx=ctx,
                             timeout_seconds=timeout_ms / 1000
                         )
                         
@@ -1282,7 +1279,7 @@ async def vcs_rebuild_database(
                         timeout_ms = async_result.get("timeout_ms", 600000)  # 10 min for builds
                         completion = await op_manager.wait_for_completion(
                             operation_id,
-                            ctx=None,
+                            ctx=ctx,
                             timeout_seconds=timeout_ms / 1000
                         )
                         
@@ -1354,6 +1351,279 @@ async def vcs_rebuild_database(
             "error": str(e),
             "output_path": None,
         }
+
+
+@vcs_tool("vcs_rebuild_addin")
+async def vcs_rebuild_addin(
+    source_dir: str,
+    timeout_seconds: float | None = None,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """
+    Rebuild the VCS add-in from source and wait until it is installed.
+
+    Derives the development copy (the ``Version Control.accda`` beside
+    ``source_dir``), launches ``RebuildAddIn``, and watches
+    ``<source>/logs/rebuild-status.json`` until this attempt reaches
+    ``complete`` or a terminal failure. The Access gate is held only for
+    the launch; other tools can run while the worker builds.
+
+    This is not ``vcs_rebuild_database``, which rebuilds a user project.
+    ``vcs_call_vba(..., ["RebuildAddIn", source])`` remains a launch-only
+    escape hatch and does not wait for the rebuild to finish.
+
+    Args:
+        source_dir: Path to ``Version Control.accda.src``
+        timeout_seconds: How long to wait after launch. Defaults to
+            ACCESS_VCS_REBUILD_TIMEOUT_SEC (20 minutes).
+
+    Returns:
+        Terminal rebuild status, including ``status``, ``status_file``,
+        ``phaseStarted``, and ``buildLog`` when present.
+    """
+    operation_id: str | None = None
+    op_manager = None
+    callback_task: asyncio.Task | None = None
+
+    try:
+        check_write_permission(get_config())
+        src_path = validate_source_directory(source_dir)
+        host_path = _development_addin_from_source(src_path)
+        if _is_installed_addin_path(str(host_path)):
+            return _installed_addin_target_refusal(
+                "vcs_rebuild_addin", "source_dir", str(host_path)
+            )
+
+        status_file, status_before = _snapshot_rebuild_status(str(src_path))
+        timeout = get_rebuild_timeout(timeout_seconds)
+        callback_url = get_callback_url()
+        callback_info: str | None = None
+        callback_queue: asyncio.Queue | None = None
+        callback_state: dict[str, Any] = {"log_messages": []}
+        reporter = MonotonicProgressReporter()
+
+        if callback_url:
+            op_manager = _get_operation_manager()
+            if op_manager:
+                op_manager.set_event_loop(asyncio.get_running_loop())
+                operation_id, callback_queue = op_manager.register_operation(
+                    timeout_ms=int(timeout * 1000),
+                    database_path=str(host_path),
+                    command="RebuildAddIn",
+                )
+                callback_info = op_manager.create_callback_info(
+                    operation_id,
+                    callback_url,
+                    "cursor",
+                )
+
+        async def _launch() -> dict[str, Any]:
+            call_args = ["RebuildAddIn", str(src_path)]
+            if callback_info:
+                call_args.append(callback_info)
+            return _execute_call_vba(
+                str(host_path),
+                "VCS.API",
+                call_args,
+            )
+
+        gate = get_access_gate()
+        launch = await gate.run_exclusive(
+            "vcs_rebuild_addin",
+            str(host_path),
+            _launch,
+            True,
+        )
+        if isinstance(launch, dict) and launch.get("error_pattern") == "server_busy":
+            return launch
+
+        launch = _with_rebuild_fields(launch, status_file, status_before)
+        if not launch.get("success"):
+            return launch
+
+        parsed = _parse_rebuild_launch(launch.get("result"))
+        status = parsed.get("status")
+        if status in ("refused", "launch-failed") or not status:
+            result = dict(launch)
+            result.update(parsed)
+            result["status_file"] = status_file
+            if status != "launched":
+                result["success"] = status == "complete"
+                if status and status != "complete":
+                    result.setdefault(
+                        "error",
+                        parsed.get("error") or f"Rebuild ended with status {status}",
+                    )
+            return result
+
+        if status != "launched":
+            result = dict(launch)
+            result.update(parsed)
+            result["status_file"] = status_file
+            return result
+
+        phase_started = (
+            parsed.get("phaseStarted")
+            or launch.get("rebuild_phase_started")
+        )
+        if not phase_started:
+            return {
+                "success": False,
+                "error": (
+                    "Rebuild launched but did not return phaseStarted; "
+                    "cannot correlate the status file."
+                ),
+                "status_file": status_file,
+                "result": launch.get("result"),
+            }
+
+        await reporter.emit(
+            ctx,
+            message="Rebuild launched; waiting for build callbacks",
+        )
+
+        if callback_queue is not None:
+            callback_task = asyncio.create_task(
+                _forward_rebuild_callbacks(
+                    callback_queue,
+                    ctx,
+                    reporter,
+                    callback_state,
+                )
+            )
+
+        watched = await wait_for_rebuild_status(
+            status_file,
+            str(phase_started),
+            timeout_sec=timeout,
+            ctx=ctx,
+            reporter=reporter,
+        )
+        if callback_task is not None and callback_task.done():
+            await callback_task
+            callback_task = None
+
+        watched["rebuild_phase_started"] = phase_started
+        watched["rebuild_status_file"] = status_file
+        if callback_state["log_messages"]:
+            watched["log_messages"] = callback_state["log_messages"]
+        if callback_state.get("log_path"):
+            watched.setdefault("log_path", callback_state["log_path"])
+        if status_before is not None:
+            watched["rebuild_status_before"] = status_before
+        if launch.get("rebuild_status_superseded") is not None:
+            watched["rebuild_status_superseded"] = launch["rebuild_status_superseded"]
+        return watched
+
+    except PermissionError as e:
+        return {"success": False, "error": str(e)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+    finally:
+        if callback_task is not None:
+            callback_task.cancel()
+            try:
+                await callback_task
+            except asyncio.CancelledError:
+                pass
+        if op_manager is not None and operation_id is not None:
+            op_manager.unregister_operation(operation_id)
+
+
+async def _forward_rebuild_callbacks(
+    queue: asyncio.Queue,
+    ctx: Context | None,
+    reporter: MonotonicProgressReporter,
+    state: dict[str, Any],
+) -> None:
+    """Forward the builder Access instance's existing HTTP callback stream.
+
+    The build phase emits its own terminal callback before the disconnected
+    worker compiles and installs the add-in. That callback ends this pump, not
+    ``vcs_rebuild_addin``; the status watcher remains authoritative for the
+    whole rebuild.
+    """
+    while True:
+        callback = await queue.get()
+        msg_type = str(callback.get("type") or "")
+        message = str(callback.get("message") or "")
+
+        if msg_type == "progress":
+            await reporter.emit(
+                ctx,
+                message=message,
+                vba_progress=callback.get("progress"),
+                vba_total=callback.get("total"),
+            )
+        elif msg_type == "log":
+            if message:
+                state["log_messages"].append(message)
+                await reporter.emit(ctx, message=message)
+        elif msg_type == "complete":
+            state["log_path"] = callback.get("log_path")
+            state["result"] = callback.get("result")
+            await reporter.emit(
+                ctx,
+                message=f"Build phase complete: {message}".rstrip(": "),
+            )
+            return
+        elif msg_type == "error":
+            state["log_path"] = callback.get("log_path")
+            state["build_error"] = message or "Build phase failed"
+            await reporter.emit(
+                ctx,
+                message=f"Build phase error: {state['build_error']}",
+            )
+            return
+        elif msg_type == "cancelled":
+            state["build_cancelled"] = True
+            await reporter.emit(
+                ctx,
+                message=f"Build phase cancelled: {message}".rstrip(": "),
+            )
+            return
+
+
+def _development_addin_from_source(source_dir: Path) -> Path:
+    """Return the development ``Version Control.accda`` beside a source folder."""
+    name = source_dir.name
+    if name.lower().endswith(".src"):
+        host = source_dir.parent / name[:-4]
+    else:
+        host = source_dir.parent / "Version Control.accda"
+    if not host.is_file():
+        raise ValueError(
+            f"Development add-in not found beside source folder: {host}. "
+            "vcs_rebuild_addin expects Version Control.accda.src next to "
+            "Version Control.accda in the add-in repository."
+        )
+    return host
+
+
+def _parse_rebuild_launch(result: Any) -> dict[str, Any]:
+    if isinstance(result, dict):
+        return result
+    if not isinstance(result, str):
+        return {}
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _with_rebuild_fields(
+    result: dict[str, Any],
+    status_file: str | None,
+    status_before: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if status_file:
+        result["rebuild_status_file"] = status_file
+        result["status_file"] = status_file
+    if status_before is not None:
+        result["rebuild_status_before"] = status_before
+    result.update(_describe_rebuild_attempt(result.get("result"), status_before))
+    return result
 
 
 @vcs_tool("vcs_get_version_info")
@@ -1849,12 +2119,11 @@ def vcs_call_vba(
     try to reach the API from inside vcs_run_vba: that code is itself delivered through
     modAPI.API, so calling back into the API is a re-entrant call and will be refused.
 
-    **Host RebuildAddIn on the development copy of the add-in** -- the
-    ``Version Control.accda`` beside the source folder in its repository. Rebuilding the
-    add-in is a repository operation and belongs to the repository's own copy, which
-    closes itself once the worker handoff is confirmed. Do not open a user database,
-    anything in the repo's Testing folder, or a scratch .accdb to satisfy the parameter.
-    The installed add-in is refused as ``database_path`` here as it is everywhere, with
+    **Prefer ``vcs_rebuild_addin(source_dir)`` to rebuild the add-in.** This tool
+    remains a launch-only escape hatch for ``RebuildAddIn``: it returns when the
+    worker is confirmed and does not wait for install. Host it on the development
+    copy (the ``Version Control.accda`` beside the source folder). The installed
+    add-in is refused as ``database_path`` here as it is everywhere, with
     ``installed_addin_refused``.
 
     Examples:
@@ -1875,6 +2144,18 @@ def vcs_call_vba(
     Returns:
         Dictionary with the function's return value or error. RebuildAddIn calls
         also include ``rebuild_status_file`` and ``rebuild_status_before``.
+    """
+    return _execute_call_vba(database_path, function_name, args, timeout_seconds)
+
+
+def _execute_call_vba(
+    database_path: str,
+    function_name: str,
+    args: list[str] | None = None,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Invoke Application.Run and normalize the result. Used by vcs_call_vba
+    and by vcs_rebuild_addin for the launch phase only.
     """
     rebuild_status_file: str | None = None
     rebuild_status_before: dict[str, Any] | None = None

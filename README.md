@@ -14,6 +14,8 @@ A lightweight MCP server (Model Context Protocol server) that provides AI agent 
 - **SQL Queries**: Execute read-only SELECT queries via the add-in's DAO connection
 - **VBA Execution**: Call existing VBA functions or run agent-generated code
 - **Async Operations**: Long-running exports/builds report progress via HTTP callbacks
+- **Add-in Rebuild**: `vcs_rebuild_addin` streams build callbacks, then watches compile/install status
+- **Terminal CLI**: `msaccess-vcs` streams the same MCP progress to stdout
 - **Add-in Options**: Read and write VCS add-in settings at runtime
 - **Safety Guardrails**: Path validation, permission checks, and write-disable mode
 
@@ -277,26 +279,38 @@ Creates a fresh database from source files, useful for clean builds and distribu
 vcs_rebuild_database("C:\\src\\mydb", "C:\\output\\fresh.accdb")
 ```
 
-#### Rebuilding the VCS add-in itself
+#### `vcs_rebuild_addin(source_dir, timeout_seconds)`
 
-`vcs_rebuild_database` rebuilds a *user* project. To rebuild `Version Control.accda` from `Version Control.accda.src` after editing add-in source:
+Rebuild `Version Control.accda` from source and wait until it is installed.
+
+Derives the development copy beside `source_dir` and launches `RebuildAddIn`.
+The callback URL and operation ID cross the disconnected worker boundary into
+the builder Access process, so the same `Log.Add` and `Log.Progress` HTTP
+callbacks used by ordinary builds provide detailed output. After the builder
+exits, the tool watches `<source>/logs/rebuild-status.json` for the compile and
+install phases until this attempt reaches `complete` or a terminal failure.
+This is not `vcs_rebuild_database`, which rebuilds a user project.
 
 ```python
-result = vcs_call_vba(
-    r"C:\path\to\msaccess-vcs-addin\Version Control.accda",
-    "VCS.API",
-    ["RebuildAddIn", r"C:\path\to\msaccess-vcs-addin\Version Control.accda.src"],
-)
-# result["result"] is JSON with status and statusFile.
-# On "launched", poll <source>/logs/rebuild-status.json until complete or *-failed,
-# matching phaseStarted against result["rebuild_phase_started"].
+vcs_rebuild_addin(r"C:\path\to\msaccess-vcs-addin\Version Control.accda.src")
 ```
 
-The first argument only picks the Access instance that hosts the call — the source folder is what decides the rebuild. Host it on the development copy of the add-in in its repository, the `Version Control.accda` beside the source folder: rebuilding the add-in is a repository operation and belongs to the repository's own copy, which closes itself once the worker handoff is confirmed. Do not open a user database, anything in the repository's `Testing` folder, or a scratch `.accdb` to satisfy the parameter. The installed add-in is refused here as everywhere — see [The installed add-in is never a target](#the-installed-add-in-is-never-a-target).
+Do not poll the status file yourself unless the tool timed out. `vcs_call_vba(..., ["RebuildAddIn", source])` remains a launch-only escape hatch.
 
-The rebuild refuses when another `MSACCESS.EXE` in the Windows session holds one of the files it replaces — it checks the loaded VBA projects in each one, so an instance with an unrelated database open is left alone. An instance that cannot be asked also blocks it, because a busy instance rejects the automation calls that would answer and so looks identical to an idle one. It never closes another Access process. On refusal, `otherInstances` names each process, what was observed about it, and which file it holds, so you can close them deliberately.
+The rebuild refuses when another `MSACCESS.EXE` in the Windows session holds one of the files it replaces — it checks the loaded VBA projects in each one, so an instance with an unrelated database open is left alone. An instance that cannot be asked also blocks it. It never closes another Access process. On refusal, `otherInstances` names each process and which file it holds.
 
-`refused` and `launch-failed` come back in the call's own JSON and mean nothing was rebuilt, so there is nothing to poll for. `launch-failed` means the helper script never started; Access is left open and the call is safe to retry. Only a `launched` result is worth polling, and the add-in confirms the worker is actually running before returning it. Access exits a few seconds later, so a COM error on that call is possible.
+`refused` and `launch-failed` come back immediately and mean nothing was rebuilt. `launch-failed` means the helper script never started; Access is left open and the call is safe to retry.
+
+#### Terminal CLI (`msaccess-vcs`)
+
+Cursor 3.13 often shows only "Running..." for MCP progress. The `msaccess-vcs` command launches this same server over stdio and prints each progress line immediately:
+
+```text
+msaccess-vcs export C:\db.accdb C:\src --full
+msaccess-vcs merge C:\db.accdb C:\src
+msaccess-vcs rebuild-database C:\src C:\out.accdb
+msaccess-vcs rebuild-addin C:\path\to\msaccess-vcs-addin\Version Control.accda.src
+```
 
 #### Running the add-in's own tests
 
@@ -515,6 +529,10 @@ Long-running operations (export, import, rebuild) support async execution with p
 2. Return immediately with an `operation_id`
 3. Receive progress updates via HTTP callbacks from VBA
 4. Support cancellation via `vcs_cancel_operation`
+
+VBA progress is per-category and can reset (for example 28/30 queries, then 1/50 modules). MCP requires a strictly increasing `progress` value, so the server sends an incrementing sequence and keeps VBA's `current/total` in the message. Log callbacks are forwarded the same way; MCP logging notifications are deprecated and are not used.
+
+Cursor 3.13 often does not display those notifications. Use `msaccess-vcs` in a terminal when you need to see updates as they arrive.
 
 The server automatically detects when another operation is in progress for the same database and returns a busy response with the active operation details.
 
@@ -764,13 +782,15 @@ msaccess-vcs-mcp/
 │   └── msaccess_vcs_mcp/
 │       ├── __init__.py
 │       ├── main.py              # MCP server entry point
-│       ├── tools.py             # MCP tool definitions (17 tools)
+│       ├── cli.py               # Terminal client with live progress
+│       ├── tools.py             # MCP tool definitions
 │       ├── config.py            # Configuration management
 │       ├── usage_logging.py     # Structured JSONL usage logging
 │       ├── security.py          # Path validation & safety
 │       ├── validation.py        # Component validation
 │       ├── addin_integration.py # VCS add-in integration
 │       ├── operation_manager.py # Async operation tracking
+│       ├── rebuild_watcher.py   # Event-driven add-in rebuild wait
 │       ├── callback_server.py   # HTTP callback server
 │       └── access_com/
 │           ├── connection.py    # COM connection management
