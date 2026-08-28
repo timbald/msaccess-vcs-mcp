@@ -43,6 +43,7 @@ from mcp.server.fastmcp import FastMCP, Context
 
 from .access_com.connection import AccessConnection, ensure_access_visible, ensure_dispatch
 from .access_com.dao_helpers import list_query_defs, list_table_defs
+from .access_com.process_qos import list_access_pids, prefer_full_power_if_created
 from .access_gate import EXEMPT_TOOLS, get_access_gate
 from .config import (
     get_config,
@@ -1243,6 +1244,7 @@ async def vcs_rebuild_database(
         # bare Access instance (no AccessConnection, which requires a
         # database path) and manage its lifecycle with try/finally.
         app = ensure_dispatch("Access.Application")
+        prefer_full_power_if_created(app)
         # The build creates and populates a database in this instance, so any
         # prompt it raises has to be visible to be answerable.
         ensure_access_visible(app)
@@ -1427,6 +1429,12 @@ async def vcs_rebuild_addin(
                 call_args,
             )
 
+        # COM launch blocks this task until RebuildAddIn returns, so emit
+        # once beforehand rather than fake steps we cannot observe.
+        await reporter.emit(ctx, message="Starting Access...")
+
+        preexisting_access_pids = list_access_pids()
+
         gate = get_access_gate()
         launch = await gate.run_exclusive(
             "vcs_rebuild_addin",
@@ -1498,6 +1506,7 @@ async def vcs_rebuild_addin(
             timeout_sec=timeout,
             ctx=ctx,
             reporter=reporter,
+            preexisting_access_pids=preexisting_access_pids,
         )
         if callback_task is not None and callback_task.done():
             await callback_task

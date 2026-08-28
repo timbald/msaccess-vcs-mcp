@@ -251,6 +251,10 @@ class AccessConnection:
                 self._app = self._create_or_reuse_instance()
                 self._db_opened_via_getobject = False
                 self._open_as_current_database(self._app)
+            if self._owns_app:
+                from .process_qos import prefer_full_power_app
+
+                prefer_full_power_app(self._app)
             ensure_access_visible(self._app)
         return self._app
 

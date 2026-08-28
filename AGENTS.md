@@ -90,6 +90,10 @@ Two rules follow from that, both enforced in `access_com/connection.py`:
 
 The one deliberate exception is `validate_access_installation()` in `config.py`: it opens no database and quits immediately, so a window would only flash on screen with nothing to act on.
 
+### Full-power cores
+
+Access is single-threaded. MCP-launched Access processes disable EcoQoS and run at Above Normal so Windows prefers a performance core. User-owned Access the server attaches to is left alone. Do not pin CPU affinity.
+
 ## Configuration
 
 All settings come from environment variables (loaded from `.env` / `.env.local` in the project root). See `.env.example` for the full list.

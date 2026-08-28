@@ -226,10 +226,20 @@ async def run_mcp_tool(
     return result
 
 
+def startup_message(command: str) -> str:
+    """Immediate stdout line before the child MCP server exists.
+
+    Progress notifications cannot arrive until that process starts and
+    the tool emits, which is a few seconds of silence without this.
+    """
+    return f"Starting {command}..."
+
+
 def main(argv: list[str] | None = None, *, session_factory=None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     name, arguments = arguments_for(args)
+    print(startup_message(args.command), flush=True)
 
     def _print(
         progress: float,

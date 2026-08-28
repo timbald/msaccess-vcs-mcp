@@ -83,6 +83,29 @@ def test_wait_wakes_on_injected_change(tmp_path):
     assert progresses == sorted(progresses)
 
 
+def test_wait_promotes_access_started_after_snapshot(tmp_path):
+    status = tmp_path / "logs" / "rebuild-status.json"
+    _write_status(status, status="complete")
+    seen: list[set[int]] = []
+
+    def promote(known: set[int]) -> set[int]:
+        seen.append(set(known))
+        return known | {99}
+
+    result = asyncio.run(wait_for_rebuild_status(
+        str(status),
+        "2026-08-27 10:00:00",
+        timeout_sec=5,
+        wait_for_change=lambda *_a: True,
+        processes_alive=lambda: True,
+        preexisting_access_pids={7, 8},
+        promote_new_access=promote,
+    ))
+    assert result["success"] is True
+    assert seen
+    assert seen[0] == {7, 8}
+
+
 def test_wait_reuses_existing_progress_sequence(tmp_path):
     status = tmp_path / "logs" / "rebuild-status.json"
     _write_status(status, status="complete")
@@ -308,6 +331,61 @@ def test_rebuild_addin_returns_refusal_without_watch(tmp_path, monkeypatch):
     assert result["success"] is False
     assert result["status"] == "refused"
     watched.assert_not_awaited()
+
+
+def test_rebuild_addin_emits_starting_access_before_launch(tmp_path, monkeypatch):
+    source = tmp_path / "Version Control.accda.src"
+    source.mkdir()
+    (tmp_path / "Version Control.accda").write_bytes(b"x")
+    launched = json.dumps({
+        "success": True,
+        "status": "launched",
+        "phaseStarted": "2026-08-27 10:00:00",
+        "statusFile": str(source / "logs" / "rebuild-status.json"),
+    })
+    order: list[str] = []
+    ctx = MagicMock()
+    ctx.report_progress = AsyncMock()
+
+    monkeypatch.setattr(tools_module, "check_write_permission", lambda _c: None)
+    monkeypatch.setattr(tools_module, "get_config", lambda: {})
+    monkeypatch.setattr(tools_module, "get_callback_url", lambda: None)
+    monkeypatch.setattr(tools_module, "_is_installed_addin_path", lambda _p: False)
+
+    def _execute(*_a, **_k):
+        started = [c.kwargs["message"] for c in ctx.report_progress.await_args_list]
+        assert started == ["Starting Access..."]
+        order.append("execute")
+        return {"success": True, "result": launched}
+
+    monkeypatch.setattr(tools_module, "_execute_call_vba", _execute)
+
+    gate = MagicMock()
+
+    async def _exclusive(_tool, _db, fn, _is_async, /, *args, **kwargs):
+        return await fn(*args, **kwargs)
+
+    gate.run_exclusive = _exclusive
+    monkeypatch.setattr(tools_module, "get_access_gate", lambda: gate)
+
+    async def _watch(*_a, **_k):
+        order.append("watch")
+        return {
+            "success": True,
+            "status": "complete",
+            "phaseStarted": "2026-08-27 10:00:00",
+        }
+
+    monkeypatch.setattr(tools_module, "wait_for_rebuild_status", _watch)
+
+    result = asyncio.run(
+        _unwrap(tools_module.vcs_rebuild_addin)(str(source), ctx=ctx)
+    )
+    assert result["success"] is True
+    assert order == ["execute", "watch"]
+    messages = [c.kwargs["message"] for c in ctx.report_progress.await_args_list]
+    assert messages[0] == "Starting Access..."
+    assert "Rebuild launched; waiting for build callbacks" in messages
 
 
 def test_rebuild_addin_watches_after_launch(tmp_path, monkeypatch):

@@ -13,6 +13,7 @@ from msaccess_vcs_mcp.cli import (
     parse_result_payload,
     print_progress,
     result_succeeded,
+    startup_message,
     stdio_server_environment,
 )
 
@@ -51,6 +52,11 @@ def test_arguments_for_each_subcommand():
         "vcs_rebuild_addin",
         {"source_dir": r"C:\src", "timeout_seconds": 90.0},
     )
+
+
+def test_startup_message():
+    assert startup_message("rebuild-addin") == "Starting rebuild-addin..."
+    assert startup_message("export") == "Starting export..."
 
 
 def test_format_progress_line():
@@ -100,9 +106,10 @@ def test_main_streams_progress_then_json(capsys):
     code = main(["rebuild-addin", r"C:\src"], session_factory=factory)
     captured = capsys.readouterr()
     lines = [line for line in captured.out.splitlines() if line]
-    assert lines[0] == "Rebuild launched"
-    assert lines[1] == "Rebuild complete"
-    assert json.loads("\n".join(lines[2:]))["status"] == "complete"
+    assert lines[0] == "Starting rebuild-addin..."
+    assert lines[1] == "Rebuild launched"
+    assert lines[2] == "Rebuild complete"
+    assert json.loads("\n".join(lines[3:]))["status"] == "complete"
     assert code == 0
 
 
@@ -120,4 +127,6 @@ def test_main_failure_exit_code(capsys):
 
     code = main(["rebuild-addin", r"C:\src"], session_factory=factory)
     assert code == 1
-    assert "Rebuild refused" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "Starting rebuild-addin..." in out
+    assert "Rebuild refused" in out

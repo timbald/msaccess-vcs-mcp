@@ -282,6 +282,7 @@ do not add a second timer wait, fixed-duration sleep, or
 - `launch-failed` means the helper script never started — Access stays open and the call is safe to retry
 - `compile-failed` leaves Access open on the rebuilt file for Debug > Compile
 - After `complete`, later MCP calls load the newly installed add-in
+- Builder and silent-installer Access processes request full-power QoS; user-owned Access is left alone
 - `vcs_call_vba(..., ["RebuildAddIn", source])` is a launch-only escape hatch
 - If the tool times out, recover by reading `<source>/logs/rebuild-status.json` and matching `phaseStarted`
 

@@ -14,6 +14,7 @@ import pytest
 
 from msaccess_vcs_mcp.access_com import connection as conn_mod
 from msaccess_vcs_mcp.access_com.connection import AccessConnection
+from msaccess_vcs_mcp.access_com import process_qos
 
 ACCDA = r"C:\Projects\msaccess-vcs-addin\Version Control.accda"
 ACCDB = r"C:\Projects\other\Some Database.accdb"
@@ -45,6 +46,7 @@ class TestAccdaOpensAsCurrentDatabase:
         with (
             patch.object(conn_mod, "win32com") as mock_win32com,
             patch.object(conn_mod, "gencache") as mock_gencache,
+            patch.object(process_qos, "prefer_full_power_app") as promote,
         ):
             mock_win32com.client.GetObject.side_effect = Exception(
                 "invalid reference to the Parent property"
@@ -58,12 +60,17 @@ class TestAccdaOpensAsCurrentDatabase:
         app.OpenCurrentDatabase.assert_called_once_with(ACCDA)
         assert c._db_opened_as_current is True
         assert c._db_opened_via_getobject is False
+        assert c._owns_app is True
+        promote.assert_called_once_with(app)
 
     def test_getobject_success_does_not_reopen(self):
         """The .accdb case: the moniker bind already made it current."""
         app = _app_with_current_db(ACCDB)
 
-        with patch.object(conn_mod, "win32com") as mock_win32com:
+        with (
+            patch.object(conn_mod, "win32com") as mock_win32com,
+            patch.object(process_qos, "prefer_full_power_app") as promote,
+        ):
             mock_win32com.client.GetObject.return_value = app
 
             c = AccessConnection(ACCDB)
@@ -73,6 +80,8 @@ class TestAccdaOpensAsCurrentDatabase:
         app.OpenCurrentDatabase.assert_not_called()
         assert c._db_opened_via_getobject is True
         assert c._db_opened_as_current is False
+        assert c._owns_app is False
+        promote.assert_not_called()
 
     def test_instance_already_holding_target_is_not_reopened(self):
         """Reusing an instance that already has our database open."""

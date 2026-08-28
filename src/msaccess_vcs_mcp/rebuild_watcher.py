@@ -19,6 +19,7 @@ import time
 from datetime import datetime
 from typing import Any, Callable
 
+from .access_com.process_qos import prefer_full_power_new_access
 from .operation_manager import MonotonicProgressReporter
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ TERMINAL_STATUSES = frozenset({
 WaitForChange = Callable[[str, float], bool]
 ReadStatus = Callable[[str], dict[str, Any] | None]
 ProcessesAlive = Callable[[], bool]
+PromoteNewAccess = Callable[[set[int]], set[int]]
 
 
 def get_rebuild_timeout(timeout_seconds: float | None = None) -> float:
@@ -205,12 +207,18 @@ async def wait_for_rebuild_status(
     processes_alive: ProcessesAlive | None = None,
     now: Callable[[], float] | None = None,
     stall_seconds: float = STALL_SECONDS,
+    preexisting_access_pids: set[int] | None = None,
+    promote_new_access: PromoteNewAccess | None = None,
 ) -> dict[str, Any]:
     """Wait until this rebuild attempt reaches a terminal status.
 
     Records whose ``phaseStarted`` does not match ``phase_started`` belong to
     another run and are ignored. Cancellation abandons the wait only; the
     worker is left running.
+
+    When ``preexisting_access_pids`` is set, Access processes that appear
+    after that snapshot (builder, silent installer) get full-power QoS.
+    Access that was already running is left alone.
     """
     timeout = get_rebuild_timeout(timeout_sec)
     wait_fn = wait_for_change or native_watch_directory
@@ -221,8 +229,15 @@ async def wait_for_rebuild_status(
     deadline = time.monotonic() + timeout
     last_status: str | None = None
     logs_dir = os.path.dirname(status_path) or "."
+    known_pids = (
+        set(preexisting_access_pids) if preexisting_access_pids is not None else None
+    )
+    promote_fn = promote_new_access or prefer_full_power_new_access
 
     while True:
+        if known_pids is not None:
+            known_pids = promote_fn(known_pids)
+
         if cancel_event is not None and cancel_event.is_set():
             return {
                 "success": False,

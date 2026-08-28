@@ -74,6 +74,37 @@ contradictory guidance.
 
 ---
 
+## 2026-08-28 — MCP-launched Access prefers a full-power core
+
+**Trigger**: The add-in's agentic rebuild was slower than a ribbon rebuild of the
+same source because Windows scheduled the COM-launched, windowless Access
+process onto an LP-E core. Access is single-threaded, so that one core is the
+operation.
+
+**Options explored**:
+- *Pin CPU affinity to P-cores.* Rejected. Topology differs by SKU, and pinning
+  is the wrong default on a machine with only performance cores.
+- *Promote every Access process the server sees.* Rejected. The server often
+  attaches to a database the user already has open.
+- *EcoQoS off + Above Normal for MCP-launched processes only* (chosen).
+  `AccessConnection` applies it when `_owns_app` is true. `vcs_rebuild_database`
+  applies it to an empty `EnsureDispatch` instance, not one that already has a
+  database open. `vcs_rebuild_addin` snapshots `MSACCESS.EXE` PIDs before launch
+  and promotes processes that appear afterward (builder, silent installer).
+  The probe in `validate_access_installation` is not promoted: it quits
+  immediately. Failures are swallowed.
+
+**Decision**: Disable `PROCESS_POWER_THROTTLING_EXECUTION_SPEED` and set Above
+Normal. Do not set an affinity mask. User-owned Access is unchanged.
+
+**What this rules out**: Pinning cores. Changing QoS on an Access instance the
+user launched. Assuming this closes the entire agent/ribbon gap.
+
+**Relevant files**: `access_com/process_qos.py`, `access_com/connection.py`,
+`rebuild_watcher.py`, `tools.py`.
+
+---
+
 ## 2026-08-27 — Carry the existing HTTP stream through add-in self-rebuild
 
 **Trigger**: The first `vcs_rebuild_addin` smoke test completed in Access but
