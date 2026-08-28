@@ -13,6 +13,7 @@ import asyncio
 import gc
 import json
 import os
+import re
 import sys
 from collections.abc import Callable
 from typing import Any
@@ -73,6 +74,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Watch timeout in seconds (default ACCESS_VCS_REBUILD_TIMEOUT_SEC)",
     )
+
+    run_tests = sub.add_parser(
+        "run-tests",
+        help="Run VBA tests with live per-test progress",
+    )
+    run_tests.add_argument("database_path")
+    run_tests.add_argument(
+        "--filter",
+        default=None,
+        help="Comma-separated test filter (module, suite, procedure, or tag)",
+    )
+    run_tests.add_argument(
+        "--timeout",
+        dest="timeout_seconds",
+        type=float,
+        default=None,
+        help="Wait timeout in seconds (default 10 minutes from the add-in)",
+    )
     return parser
 
 
@@ -102,6 +121,13 @@ def arguments_for(args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
         if args.timeout_seconds is not None:
             payload["timeout_seconds"] = args.timeout_seconds
         return "vcs_rebuild_addin", payload
+    if args.command == "run-tests":
+        payload = {"database_path": args.database_path}
+        if args.filter:
+            payload["filter"] = args.filter
+        if args.timeout_seconds is not None:
+            payload["timeout_seconds"] = args.timeout_seconds
+        return "vcs_run_tests", payload
     raise ValueError(f"Unknown command: {args.command}")
 
 
@@ -121,6 +147,75 @@ def format_progress_line(
     return (message or "").rstrip()
 
 
+_COUNT_SUFFIX = re.compile(r"\(\d+(?:\.\d+)?/\d+(?:\.\d+)?\)\s*$")
+_DOTS_ONLY = re.compile(r"^\.+$")
+_DOTS_PER_LINE = 80
+
+
+class ProgressPrinter:
+    """Print MCP progress.
+
+    For ``run-tests``, ``(n/m)`` progress is ignored (not shown). Batched
+    ``....`` log callbacks print as pytest-style dots. A named line may share
+    that callback (dots, newline, then PASS/FAIL/ERROR/EMPTY).
+    """
+
+    def __init__(self, *, compact_tests: bool = False) -> None:
+        self.compact_tests = compact_tests
+        self._dot_line_len = 0
+
+    def __call__(
+        self,
+        progress: float,
+        total: float | None,
+        message: str | None,
+        *,
+        file=None,
+    ) -> None:
+        line = format_progress_line(progress, total, message)
+        if not line:
+            return
+        out = file if file is not None else sys.stdout
+        if self.compact_tests:
+            self._print_test_stream(line, out)
+            return
+        print(line, file=out, flush=True)
+
+    def _print_test_stream(self, line: str, out) -> None:
+        for piece in line.splitlines():
+            if not piece.strip():
+                continue
+            if _COUNT_SUFFIX.search(piece):
+                continue
+            stripped = piece.strip()
+            if _DOTS_ONLY.match(stripped):
+                for _ in stripped:
+                    self._print_dot(out)
+                continue
+            self._end_dot_line(out)
+            print(piece.rstrip(), file=out, flush=True)
+
+    def _print_dot(self, out=None) -> None:
+        dest = out if out is not None else sys.stdout
+        print(".", end="", file=dest, flush=True)
+        self._dot_line_len += 1
+        if self._dot_line_len >= _DOTS_PER_LINE:
+            print(file=dest, flush=True)
+            self._dot_line_len = 0
+
+    def _end_dot_line(self, out=None) -> None:
+        dest = out if out is not None else sys.stdout
+        if self._dot_line_len:
+            print(file=dest, flush=True)
+            self._dot_line_len = 0
+
+    def finish(self, *, file=None) -> None:
+        self._end_dot_line(file)
+
+    def close_status(self, *, file=None) -> None:
+        self.finish(file=file)
+
+
 def print_progress(
     progress: float,
     total: float | None,
@@ -136,6 +231,73 @@ def print_progress(
         file=file if file is not None else sys.stdout,
         flush=True,
     )
+
+
+def format_duration_ms(ms: Any) -> str:
+    try:
+        value = float(ms)
+    except (TypeError, ValueError):
+        return ""
+    if value < 1000:
+        return f"{int(value)}ms"
+    if value < 60000:
+        return f"{value / 1000:.2f}s"
+    return f"{value / 60000:.1f}m"
+
+
+def compact_result_payload(command: str, payload: Any) -> Any:
+    """Drop bulky fields from CLI JSON. The MCP tool still returns the full map."""
+    if command != "run-tests" or not isinstance(payload, dict):
+        return payload
+    compact = dict(payload)
+    compact.pop("tests", None)
+    compact.pop("log_messages", None)
+    return compact
+
+
+def completion_message(command: str, payload: Any, succeeded: bool) -> str:
+    """Human-readable last line so a watcher does not have to parse JSON."""
+    if command == "run-tests":
+        return _test_completion_message(payload, succeeded)
+    if command == "rebuild-addin":
+        return "Rebuild complete." if succeeded else "Rebuild failed."
+    if command == "rebuild-database":
+        return "Database rebuilt." if succeeded else "Rebuild failed."
+    if command == "export":
+        return "Export complete." if succeeded else "Export failed."
+    if command == "merge":
+        return "Merge complete." if succeeded else "Merge failed."
+    return "Done." if succeeded else "Failed."
+
+
+def _test_completion_message(payload: Any, succeeded: bool) -> str:
+    if not isinstance(payload, dict):
+        return "Tests passed." if succeeded else "Tests failed."
+    summary = payload.get("summary") or {}
+    parts: list[str] = []
+    subs = summary.get("subs")
+    assertions = summary.get("assertions")
+    if subs is not None:
+        parts.append(f"{subs} subs")
+    if assertions is not None:
+        parts.append(f"{assertions} assertions")
+    failed = summary.get("failed") or 0
+    errored = summary.get("errored") or 0
+    empty = summary.get("empty") or 0
+    if failed:
+        parts.append(f"{failed} failed")
+    if errored:
+        parts.append(f"{errored} errored")
+    if empty:
+        parts.append(f"{empty} empty")
+    elapsed = format_duration_ms(payload.get("durationMs"))
+    verb = "passed" if succeeded else "failed"
+    if not parts:
+        return f"Tests {verb}."
+    body = ", ".join(parts)
+    if elapsed:
+        return f"Tests {verb}. {body} in {elapsed}"
+    return f"Tests {verb}. {body}"
 
 
 def _tool_result_text(result: Any) -> str:
@@ -240,37 +402,35 @@ def main(argv: list[str] | None = None, *, session_factory=None) -> int:
     args = parser.parse_args(argv)
     name, arguments = arguments_for(args)
     print(startup_message(args.command), flush=True)
-
-    def _print(
-        progress: float,
-        total: float | None,
-        message: str | None,
-    ) -> None:
-        print_progress(progress, total, message)
+    printer = ProgressPrinter(compact_tests=args.command == "run-tests")
 
     try:
         result = asyncio.run(
             run_mcp_tool(
                 name,
                 arguments,
-                on_progress=_print,
+                on_progress=printer,
                 session_factory=session_factory,
             )
         )
     except KeyboardInterrupt:
+        printer.finish()
         print("Cancelled.", file=sys.stderr, flush=True)
         return 130
 
+    printer.finish()
     text = _tool_result_text(result)
     payload = parse_result_payload(text)
-    if isinstance(payload, (dict, list)):
-        print(json.dumps(payload, indent=2), flush=True)
+    display = compact_result_payload(args.command, payload)
+    if isinstance(display, (dict, list)):
+        print(json.dumps(display, indent=2), flush=True)
     else:
         print(text, flush=True)
 
-    if getattr(result, "isError", False):
-        return 1
-    return 0 if result_succeeded(payload) else 1
+    tool_error = bool(getattr(result, "isError", False))
+    succeeded = (not tool_error) and result_succeeded(payload)
+    print(completion_message(args.command, payload, succeeded), flush=True)
+    return 0 if succeeded else 1
 
 
 if __name__ == "__main__":

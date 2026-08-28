@@ -8,10 +8,14 @@ from types import SimpleNamespace
 from msaccess_vcs_mcp.cli import (
     arguments_for,
     build_parser,
+    compact_result_payload,
+    completion_message,
+    format_duration_ms,
     format_progress_line,
     main,
     parse_result_payload,
     print_progress,
+    ProgressPrinter,
     result_succeeded,
     startup_message,
     stdio_server_environment,
@@ -51,6 +55,23 @@ def test_arguments_for_each_subcommand():
     assert arguments_for(addin) == (
         "vcs_rebuild_addin",
         {"source_dir": r"C:\src", "timeout_seconds": 90.0},
+    )
+
+    tests = parser.parse_args([
+        "run-tests",
+        r"C:\db.accda",
+        "--filter",
+        "SQL,-slow",
+        "--timeout",
+        "90",
+    ])
+    assert arguments_for(tests) == (
+        "vcs_run_tests",
+        {
+            "database_path": r"C:\db.accda",
+            "filter": "SQL,-slow",
+            "timeout_seconds": 90.0,
+        },
     )
 
 
@@ -109,7 +130,8 @@ def test_main_streams_progress_then_json(capsys):
     assert lines[0] == "Starting rebuild-addin..."
     assert lines[1] == "Rebuild launched"
     assert lines[2] == "Rebuild complete"
-    assert json.loads("\n".join(lines[3:]))["status"] == "complete"
+    assert lines[-1] == "Rebuild complete."
+    assert json.loads("\n".join(lines[3:-1]))["status"] == "complete"
     assert code == 0
 
 
@@ -130,3 +152,112 @@ def test_main_failure_exit_code(capsys):
     out = capsys.readouterr().out
     assert "Starting rebuild-addin..." in out
     assert "Rebuild refused" in out
+    assert out.strip().splitlines()[-1] == "Rebuild failed."
+
+
+def test_format_duration_ms():
+    assert format_duration_ms(25) == "25ms"
+    assert format_duration_ms(1480) == "1.48s"
+    assert format_duration_ms(196691) == "3.3m"
+
+
+def test_completion_message_run_tests():
+    payload = {
+        "success": True,
+        "durationMs": 196691,
+        "summary": {
+            "subs": 468,
+            "assertions": 2281,
+            "passed": 2278,
+            "failed": 0,
+            "errored": 0,
+            "empty": 3,
+        },
+        "tests": {"modFoo.Bar": {"status": "PASSED"}},
+    }
+    assert completion_message("run-tests", payload, True) == (
+        "Tests passed. 468 subs, 2281 assertions, 3 empty in 3.3m"
+    )
+    payload["success"] = False
+    payload["summary"]["failed"] = 2
+    assert completion_message("run-tests", payload, False) == (
+        "Tests failed. 468 subs, 2281 assertions, 2 failed, 3 empty in 3.3m"
+    )
+
+
+def test_compact_result_payload_strips_tests():
+    payload = {
+        "success": True,
+        "summary": {"subs": 1},
+        "tests": {"modFoo.Bar": {"status": "PASSED"}},
+        "log_messages": ["."],
+        "log_path": r"C:\log.log",
+    }
+    compact = compact_result_payload("run-tests", payload)
+    assert "tests" not in compact
+    assert "log_messages" not in compact
+    assert compact["summary"] == {"subs": 1}
+    assert compact["log_path"] == r"C:\log.log"
+    assert compact_result_payload("rebuild-addin", payload)["tests"]
+
+
+def test_progress_printer_marches_dots_and_names_slow(capsys):
+    printer = ProgressPrinter(compact_tests=True)
+    printer(1, None, "modFoo.A (1/4)")
+    printer(2, None, "....\nPASS  modFoo.Slow  1.20s")
+    printer(3, None, ".")
+    printer.finish()
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert "modFoo.A (1/4)" not in captured.out
+    assert captured.out == "....\nPASS  modFoo.Slow  1.20s\n.\n"
+
+
+def test_progress_printer_finish_emits_last_fast_dot(capsys):
+    printer = ProgressPrinter(compact_tests=True)
+    printer(1, None, "...")
+    printer.finish()
+    assert capsys.readouterr().out == "...\n"
+
+
+def test_main_run_tests_omits_tests_and_prints_summary(capsys):
+    async def factory(name, arguments, on_progress):
+        assert name == "vcs_run_tests"
+        assert arguments["filter"] == "clsTestEncoding"
+        await on_progress(1, None, "clsTestEncoding.TestUtf8 (1/3)")
+        await on_progress(2, None, "...")
+        return SimpleNamespace(
+            content=[SimpleNamespace(text=json.dumps({
+                "success": True,
+                "durationMs": 350,
+                "summary": {
+                    "subs": 3,
+                    "assertions": 12,
+                    "passed": 12,
+                    "failed": 0,
+                    "errored": 0,
+                    "empty": 0,
+                },
+                "tests": {"clsTestEncoding.TestUtf8": {"status": "PASSED"}},
+                "log_path": r"C:\TestRun.log",
+            }))],
+            isError=False,
+        )
+
+    code = main(
+        ["run-tests", r"C:\db.accda", "--filter", "clsTestEncoding"],
+        session_factory=factory,
+    )
+    captured = capsys.readouterr()
+    assert code == 0
+    assert "clsTestEncoding.TestUtf8 (1/3)" not in captured.out
+    assert captured.err == ""
+    lines = [line for line in captured.out.splitlines() if line]
+    assert lines[0] == "Starting run-tests..."
+    assert lines[1] == "..."
+    assert lines[-1] == "Tests passed. 3 subs, 12 assertions in 350ms"
+    payload = json.loads("\n".join(lines[2:-1]))
+    assert "tests" not in payload
+    assert payload["summary"]["subs"] == 3
+    assert payload["log_path"] == r"C:\TestRun.log"
+

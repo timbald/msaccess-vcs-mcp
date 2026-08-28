@@ -109,3 +109,30 @@ def test_wait_for_completion_without_ctx_still_collects_logs():
     result = asyncio.run(_run())
     assert result["success"] is True
     assert result["log_messages"] == ["hello"]
+
+
+def test_wait_for_completion_forwards_results_path_on_error():
+    """Failed test runs post type error but still attach results_path."""
+    manager = OperationManager.get_instance()
+    operation_id, _queue = manager.register_operation(timeout_ms=5000)
+
+    async def _run():
+        async def _feed():
+            await asyncio.sleep(0)
+            manager.route_callback(operation_id, {
+                "type": "error",
+                "message": "Operation failed",
+                "log_path": r"C:\src\logs\TestRun_1.log",
+                "results_path": r"C:\src\logs\TestResults_1.json",
+            })
+
+        feeder = asyncio.create_task(_feed())
+        result = await manager.wait_for_completion(operation_id, timeout_seconds=2)
+        await feeder
+        return result
+
+    result = asyncio.run(_run())
+    assert result["success"] is False
+    assert result["error"] == "Operation failed"
+    assert result["log_path"] == r"C:\src\logs\TestRun_1.log"
+    assert result["results_path"] == r"C:\src\logs\TestResults_1.json"

@@ -158,6 +158,102 @@ def _read_log_excerpt(log_path: str, tail_lines: int = 50, max_chars: int = 4000
     return excerpt or None
 
 
+_TEST_NO_RESULTS_ERROR = (
+    "Test runner returned no results. Ensure modTestAssert is "
+    "installed in the target database and that test modules "
+    "contain TestAssert calls."
+)
+
+
+def _apply_test_run_success(parsed: dict[str, Any]) -> dict[str, Any]:
+    """Set ``success`` from the runner summary, not from Operation.Result."""
+    summary = parsed.get("summary", {})
+    parsed["success"] = (
+        summary.get("failed", 1) == 0
+        and summary.get("errored", 1) == 0
+        and summary.get("subs", 0) > 0
+    )
+    return parsed
+
+
+def _parse_test_runner_json(result_json: Any) -> dict[str, Any]:
+    """Parse the sync ``RunFilteredTests`` return into a tool result."""
+    if not result_json or (isinstance(result_json, str) and not str(result_json).strip()):
+        return {"success": False, "error": _TEST_NO_RESULTS_ERROR}
+
+    if isinstance(result_json, str):
+        try:
+            parsed = json.loads(result_json)
+        except json.JSONDecodeError:
+            return {
+                "success": False,
+                "error": f"Failed to parse test results JSON: {result_json[:200]}",
+            }
+    else:
+        parsed = result_json if isinstance(result_json, dict) else {"result": result_json}
+
+    if not isinstance(parsed, dict):
+        return {"success": True, "result": parsed}
+    if "summary" not in parsed and "tests" not in parsed:
+        return parsed if "success" in parsed else {"success": True, "result": parsed}
+    return _apply_test_run_success(parsed)
+
+
+def _load_test_results_file(path: str | None) -> dict[str, Any] | None:
+    """Read ``TestResults_*.json`` written by the add-in, or None if unreadable."""
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8-sig") as handle:
+            parsed = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _test_results_from_completion(completion: dict[str, Any]) -> dict[str, Any]:
+    """Build the tool result from an MCP complete/error/cancelled callback.
+
+    Failed tests finish as ``eorFailed`` (callback type ``error``) but still
+    write ``results_path``. Prefer that file over the callback's error string.
+    """
+    loaded = _load_test_results_file(completion.get("results_path"))
+    if loaded is not None:
+        parsed = _apply_test_run_success(loaded)
+        if completion.get("cancelled"):
+            parsed["cancelled"] = True
+            parsed["success"] = False
+        log_path = completion.get("log_path")
+        if log_path:
+            parsed.setdefault("log_path", log_path)
+            parsed.setdefault("logPath", log_path)
+        return parsed
+
+    raw = completion.get("result")
+    if raw not in (None, ""):
+        return _parse_test_runner_json(raw)
+
+    if completion.get("cancelled"):
+        return {
+            "success": False,
+            "cancelled": True,
+            "error": completion.get("message") or "Test run was cancelled",
+        }
+
+    if completion.get("success") and not completion.get("error"):
+        return {"success": False, "error": _TEST_NO_RESULTS_ERROR}
+
+    result: dict[str, Any] = {
+        "success": False,
+        "error": completion.get("error")
+        or completion.get("message")
+        or "Test run failed",
+    }
+    if completion.get("log_path"):
+        result["log_path"] = completion["log_path"]
+    return result
+
+
 def _attach_log_context(
     result: dict[str, Any],
     source_dir: str | os.PathLike[str],
@@ -280,7 +376,7 @@ mcp = FastMCP(
         "MCP progress notifications are best-effort in Cursor: the server emits them, "
         "but some Cursor builds show only \"Running...\" until the tool returns. For "
         "live terminal output, run `msaccess-vcs rebuild-addin <source>` (or export / "
-        "merge / rebuild-database).\n"
+        "merge / rebuild-database / run-tests).\n"
         "After any MCP client timeout (`-32001`), call vcs_get_recent_calls() to learn "
         "what actually executed — the server may have finished after the client gave up.\n"
         "One server process is shared across Cursor windows. When another window holds the "
@@ -299,7 +395,9 @@ mcp = FastMCP(
         "instead. This server opens the development copy for you, so no manual pre-open "
         "step is needed. Always run these tests through this server rather than from the "
         "add-in's own window -- an all-EMPTY result (zero assertions) means the harness "
-        "was bypassed, not that the tests passed.\n\n"
+        "was bypassed, not that the tests passed. For live per-test output, run "
+        "`msaccess-vcs run-tests <database>` from a terminal (same pattern as "
+        "rebuild-addin). Headless means no add-in UI, not a hidden Access window.\n\n"
         "**The installed add-in is never a target:**\n"
         "No tool accepts the installed add-in under %APPDATA%\\MSAccessVCS as "
         "database_path, output_path, or template_path. That file exists to be loaded as "
@@ -343,7 +441,8 @@ mcp = FastMCP(
         "— call an existing public VBA function\n"
         "- vcs_execute_sql(database_path*, sql*, max_rows?) "
         "— run a read-only SELECT query via DAO\n"
-        "- vcs_run_tests(database_path*, filter?) — run VBA tests\n"
+        "- vcs_run_tests(database_path*, filter?, timeout_seconds?) — run VBA tests "
+        "(prefer `msaccess-vcs run-tests` for live per-test output)\n"
         "- vcs_compile_vba(database_path*, suppress_warnings?) — compile all VBA modules\n"
         "- vcs_check_vba_compiled(database_path*) — check VBA compilation status\n"
         "- vcs_get_option(database_path*, option_name*) — read a VCS option value\n"
@@ -2838,9 +2937,11 @@ def vcs_get_log(
 
 
 @vcs_tool("vcs_run_tests")
-def vcs_run_tests(
+async def vcs_run_tests(
     database_path: str,
     filter: str | None = None,
+    timeout_seconds: float | None = None,
+    ctx: Context = None,
 ) -> dict[str, Any]:
     """
     Run VBA tests in the database using the VCS add-in's built-in test runner.
@@ -2848,6 +2949,15 @@ def vcs_run_tests(
     Discovers test modules (standard modules and classes containing TestAssert
     calls), executes their test procedures, and returns structured JSON results
     with per-test status, assertion details, timing, and tags.
+
+    Headless here means no add-in UI (no web runner, no console form, silent
+    dialogs) -- not a hidden Access window. The host instance stays visible.
+
+    **Live output:** MCP progress is best-effort in Cursor. For a live stream
+    (dots for fast passes, names for tests ≥ 1s, FAIL lines, then a human
+    completion line), run ``msaccess-vcs run-tests <database>`` from a
+    terminal and keep that command in the foreground. This tool still returns
+    the full ``tests`` map for programmatic reruns.
 
     **Filter syntax** (comma-separated, applied as a single string):
 
@@ -2884,6 +2994,8 @@ def vcs_run_tests(
         database_path: Path to Access database (.accdb, .accda, .mdb)
         filter: Optional comma-separated filter string. When omitted, runs
             all tests.
+        timeout_seconds: How long to wait for the async run (default from the
+            add-in's timeout_ms, 10 minutes). Unused on the sync fallback.
 
     Returns:
         Dictionary with ``success`` (True when all tests pass, none errored,
@@ -2892,6 +3004,10 @@ def vcs_run_tests(
     """
     try:
         db_path = validate_database_path(database_path)
+
+        busy_error = _check_database_busy(str(db_path))
+        if busy_error:
+            return busy_error
 
         with AccessConnection(str(db_path)) as conn:
             app, db = conn.connect()
@@ -2907,33 +3023,41 @@ def vcs_run_tests(
             # Set the filter option (session-scoped, does not modify user's vcs-options.json)
             addin.call_sync("SetOption", "DefaultTestFilter", filter or "")
 
-            result_json = addin.call_sync("RunFilteredTests")
+            callback_url = get_callback_url()
+            op_manager = _get_operation_manager()
 
-            if not result_json or (isinstance(result_json, str) and not result_json.strip()):
-                return {
-                    "success": False,
-                    "error": (
-                        "Test runner returned no results. Ensure modTestAssert is "
-                        "installed in the target database and that test modules "
-                        "contain TestAssert calls."
-                    ),
-                }
-
-            if isinstance(result_json, str):
+            if callback_url and op_manager:
+                op_manager.set_event_loop(asyncio.get_running_loop())
+                operation_id, _queue = op_manager.register_operation(
+                    database_path=str(db_path),
+                    command="RunFilteredTests",
+                )
+                callback_info = op_manager.create_callback_info(
+                    operation_id, callback_url, "cursor"
+                )
                 try:
-                    parsed = json.loads(result_json)
-                except json.JSONDecodeError:
-                    return {"success": False, "error": f"Failed to parse test results JSON: {result_json[:200]}"}
-            else:
-                parsed = result_json if isinstance(result_json, dict) else {"result": result_json}
+                    async_result = addin.call_async(callback_info, "RunFilteredTests")
+                    if async_result.get("sync"):
+                        op_manager.unregister_operation(operation_id)
+                        return _parse_test_runner_json(async_result.get("result"))
+                    if async_result.get("async"):
+                        timeout_ms = async_result.get("timeout_ms", 600000)
+                        wait_timeout = (
+                            timeout_seconds
+                            if timeout_seconds is not None
+                            else timeout_ms / 1000
+                        )
+                        completion = await op_manager.wait_for_completion(
+                            operation_id,
+                            ctx=ctx,
+                            timeout_seconds=wait_timeout,
+                        )
+                        return _test_results_from_completion(completion)
+                    op_manager.unregister_operation(operation_id)
+                except Exception:
+                    op_manager.unregister_operation(operation_id)
 
-            summary = parsed.get("summary", {})
-            parsed["success"] = (
-                summary.get("failed", 1) == 0
-                and summary.get("errored", 1) == 0
-                and summary.get("subs", 0) > 0
-            )
-            return parsed
+            return _parse_test_runner_json(addin.call_sync("RunFilteredTests"))
 
     except Exception as e:
         return {"success": False, "error": str(e)}

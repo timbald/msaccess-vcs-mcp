@@ -74,6 +74,126 @@ contradictory guidance.
 
 ---
 
+## 2026-08-28 — Optional leave-open for COM-created Access
+
+**Trigger**: Sequential `msaccess-vcs run-tests` always Quit the Access the
+CLI child created, so there was no way to time a boosted process and then
+reattach to the same PID. QoS is process-lifetime; attach to a leftover
+boosted instance is the comparison that matters.
+
+**Options explored**:
+- *Never Quit when UserControl is True.* Rejected as the default. Owned
+  instances would leak Access processes after every CLI or MCP session.
+- *ACCESS_VCS_LEAVE_ACCESS_OPEN* (chosen). When set, `close()` still releases
+  COM but skips `CloseCurrentDatabase`/`Quit`. Attach later finds the same
+  PID via GetObject. Default remains Quit for owned instances.
+
+**Decision**: Opt-in env flag only. User-owned Access is unchanged.
+
+**What this rules out**: Leaving every MCP-created Access running by default.
+
+**Relevant files**: `access_com/connection.py`, `tests/test_access_visibility.py`.
+
+---
+
+## 2026-08-28 — CLI test output is compact pytest-style dots
+
+**Trigger**: `msaccess-vcs run-tests` printed every MCP log fragment (Access
+same-line console layout) and then the full per-test JSON. A 468-test run
+took ~3 minutes, most of it HTTP. The last line was not a human summary.
+
+**Options explored**:
+- *Leave the stream as raw `Log.Add`.* Rejected after the first full run.
+- *Live current-test name via `\\r` on stderr.* Rejected. Cursor's capture is
+  not a TTY, so overwrite is unreadable.
+- *Infer a dot from each start-of-test `(n/m)` progress.* Rejected. That is
+  468 HTTP posts. The add-in now coalesces fast passes into log lines.
+- *Print `.` from those batched log payloads; ignore `(n/m)`; compact JSON
+  plus a human completion line* (chosen). Wrap dots at 80. Names remain the
+  add-in's ≥ 1s PASS and FAIL/ERROR/EMPTY lines. `vcs_run_tests` as an MCP
+  tool still returns the `tests` map.
+
+**Decision**: The CLI is for watching. The MCP tool is for programmatic
+reruns. Completion is a sentence such as `Tests passed. 468 subs, 2281
+assertions, 3 empty in 14.42s`, not a sentinel.
+
+**What this rules out**: Dumping the `tests` map to CLI stdout. Printing
+`(n/m)` progress during `run-tests` (rebuild/export still do). Using progress
+callbacks as the pytest dot stream. A `VCS_CLI_EXIT` token.
+
+**Relevant files**: `cli.py` (`ProgressPrinter`, `compact_result_payload`,
+`completion_message`), add-in `clsLog.cls`, `clsTestRunner.cls`.
+
+---
+
+## 2026-08-28 — Agent test runs stream through APIAsync and the CLI
+
+**Trigger**: Agent-initiated test runs returned one JSON blob after the suite
+finished. Cursor shows only "Running..." for MCP progress, so a long run looked
+stuck. Builds already streamed: `APIAsync` + HTTP `Log.Add`/`Log.Progress` +
+`msaccess-vcs rebuild-addin` printing each notification. Tests already posted
+those callbacks when `MCP.IsActive`, but `vcs_run_tests` used blocking
+`call_sync("RunFilteredTests")`, which never registered a callback.
+
+**Options explored**:
+- *Keep the sync COM call and tail `TestRun_*.log`.* Rejected. Duplicates the
+  callback path builds already use, and the log is gitignored so agents miss it.
+- *Register the callback then block in `call_sync`.* Rejected. The tool handler
+  would hold COM for the whole suite and could not emit MCP progress until
+  return.
+- *Same async path as export* (chosen). `RunFilteredTests` joins the
+  `APIAsync` timer list. MCP waits on callbacks. `msaccess-vcs run-tests`
+  prints each line. Old add-ins still return `{sync: true, result: ...}`.
+
+Failed tests complete as `eorFailed`, which posts type `error`. The results
+file rides on every terminal callback as `results_path` so MCP can still
+return per-test JSON for reruns. What the CLI prints is the compact stream
+above, not every Access-console fragment.
+
+**Decision**: `vcs_run_tests` follows the export pattern. The CLI is the live
+output path; the MCP tool remains for short or programmatic runs. Tool
+`success` still comes from the runner summary, not from `Operation.Result`.
+
+**What this rules out**: Treating a finished-with-failures suite as a lost
+result. Adding a second log-tailer for tests. Exempting `vcs_run_tests` from
+the Access gate (the suite runs in the connected instance).
+
+**Relevant files**: `tools.py` (`vcs_run_tests`), `cli.py`,
+`operation_manager.py`, add-in `modAPI.bas`, `clsOperation.cls`,
+`clsTestRunner.cls`.
+
+---
+
+## 2026-08-28 — Owned Access instances get UserControl after the database opens
+
+**Trigger**: Headless MCP test runs created a new Access for
+`Version Control.accda` and set `Visible = True`, but the window often never
+appeared as a normal interactive app. Automation-created Access with
+`UserControl` still False stays off the desktop even when Visible is True.
+The common `EnsureDispatch` new-instance path never set `UserControl`; only
+the isolated `DispatchEx` path restored it after open.
+
+**Options explored**:
+- *Set UserControl before OpenCurrentDatabase.* Rejected. AutoExec/`AutoRun`
+  would see a person watching and open the installer form.
+- *Visible only, as in the 2026-08-12 rule.* Insufficient for COM-created
+  instances; that is the gap this closes.
+- *UserControl = True after open, on owned instances only* (chosen). AutoExec
+  already ran with the flag down. Attached user instances are left alone.
+
+**Decision**: `_get_access_app` still shows the window after the database is
+open, then sets `UserControl = True` when `_owns_app`.
+`validate_access_installation()` stays hidden (no database, quit immediately).
+
+**What this rules out**: Hiding MCP-created Access for tidiness. Setting
+`UserControl` before a database opens. Forcing `UserControl` on instances the
+server attached to.
+
+**Relevant files**: `access_com/connection.py`
+(`_ensure_owned_instance_interactive`), `tests/test_access_visibility.py`.
+
+---
+
 ## 2026-08-28 — MCP-launched Access prefers a full-power core
 
 **Trigger**: The add-in's agentic rebuild was slower than a ribbon rebuild of the
@@ -328,6 +448,12 @@ environment-dependent. Stub `_find_access_in_rot` too; `_fake_access` in
 ---
 
 ## 2026-08-12 — Access instances holding a database stay visible
+
+> **⚠ Partially superseded** (2026-08-28): `Visible = True` is necessary but
+> not sufficient for instances the server creates. Those also need
+> `UserControl = True` *after* the database is open, or the window often never
+> appears as a normal interactive app. See "Owned Access instances get
+> UserControl after the database opens" above.
 
 **Trigger**: COM automation starts Access hidden, and nothing in the server
 ever showed the window. Access still asks questions only a person can answer —

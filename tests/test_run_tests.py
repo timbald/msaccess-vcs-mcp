@@ -1,5 +1,6 @@
 """Tests for vcs_run_tests tool."""
 
+import asyncio
 import json
 import os
 from unittest.mock import Mock, MagicMock, patch, call
@@ -139,11 +140,19 @@ def _patch_tool_infra(monkeypatch, tmp_path_factory):
     monkeypatch.setenv("ACCESS_VCS_DIAGNOSTIC_LOG_DIR", str(diag_dir))
 
 
+def _unwrap(tool_fn):
+    fn = tool_fn
+    while hasattr(fn, "__wrapped__"):
+        fn = fn.__wrapped__
+    return fn
+
+
 def _call_run_tests(tmp_path, call_sync_return, filter_value=None):
-    """Call vcs_run_tests with fully mocked COM layer.
+    """Call vcs_run_tests with fully mocked COM layer (sync fallback).
 
     Patches AccessConnection, VCSAddinIntegration, validate_database_path,
-    and get_config so the tool body runs against mock objects.
+    and get_config so the tool body runs against mock objects. Callbacks
+    are disabled so the old add-in path (call_sync RunFilteredTests) is used.
     """
     mock_app, mock_conn, mock_addin = _build_mocks(
         tmp_path, call_sync_return=call_sync_return
@@ -169,16 +178,12 @@ def _call_run_tests(tmp_path, call_sync_return, filter_value=None):
             "msaccess_vcs_mcp.tools.get_config",
             return_value={"ACCESS_VCS_ADDIN_PATH": str(tmp_path / "Version Control.accda")},
         ),
+        patch("msaccess_vcs_mcp.tools.get_callback_url", return_value=None),
+        patch("msaccess_vcs_mcp.tools._check_database_busy", return_value=None),
     ):
         from msaccess_vcs_mcp.tools import vcs_run_tests
 
-        # vcs_run_tests is wrapped by @vcs_tool into an async coroutine;
-        # unwrap to the sync body via __wrapped__
-        sync_fn = vcs_run_tests
-        while hasattr(sync_fn, "__wrapped__"):
-            sync_fn = sync_fn.__wrapped__
-
-        result = sync_fn(db_path, filter=filter_value)
+        result = asyncio.run(_unwrap(vcs_run_tests)(db_path, filter=filter_value))
 
     return result, mock_app, mock_addin
 
@@ -306,14 +311,12 @@ class TestRunTestsEdgeCases:
             patch("msaccess_vcs_mcp.tools.VCSAddinIntegration", return_value=mock_addin),
             patch("msaccess_vcs_mcp.tools.validate_database_path", return_value=tmp_path / "test.accdb"),
             patch("msaccess_vcs_mcp.tools.get_config", return_value={"ACCESS_VCS_ADDIN_PATH": "test"}),
+            patch("msaccess_vcs_mcp.tools.get_callback_url", return_value=None),
+            patch("msaccess_vcs_mcp.tools._check_database_busy", return_value=None),
         ):
             from msaccess_vcs_mcp.tools import vcs_run_tests
 
-            sync_fn = vcs_run_tests
-            while hasattr(sync_fn, "__wrapped__"):
-                sync_fn = sync_fn.__wrapped__
-
-            result = sync_fn(db_path)
+            result = asyncio.run(_unwrap(vcs_run_tests)(db_path))
 
         assert result["success"] is False
         assert "COM disconnected" in result["error"]
@@ -353,3 +356,110 @@ class TestRunTestsCallOrder:
         assert calls[1] == call("RunFilteredTests")
 
         mock_addin.load_addin.assert_called_once()
+
+
+def _call_run_tests_async(tmp_path, *, completion, filter_value=None, results=None):
+    """Call vcs_run_tests on the APIAsync callback path."""
+    mock_app, mock_conn, mock_addin = _build_mocks(tmp_path)
+    mock_addin.call_async.return_value = {"async": True, "timeout_ms": 1000}
+
+    payload = dict(completion)
+    if results is not None:
+        results_path = tmp_path / "TestResults.json"
+        results_path.write_text(json.dumps(results), encoding="utf-8")
+        payload["results_path"] = str(results_path)
+
+    op_manager = MagicMock()
+    op_manager.register_operation.return_value = ("op-1", MagicMock())
+    op_manager.create_callback_info.return_value = "{}"
+
+    async def _wait(*_a, **_k):
+        return payload
+
+    op_manager.wait_for_completion = _wait
+
+    db_path = str(tmp_path / "test.accdb")
+    (tmp_path / "test.accdb").touch()
+
+    with (
+        patch("msaccess_vcs_mcp.tools.AccessConnection", return_value=mock_conn),
+        patch("msaccess_vcs_mcp.tools.VCSAddinIntegration", return_value=mock_addin),
+        patch("msaccess_vcs_mcp.tools.validate_database_path", return_value=tmp_path / "test.accdb"),
+        patch(
+            "msaccess_vcs_mcp.tools.get_config",
+            return_value={"ACCESS_VCS_ADDIN_PATH": str(tmp_path / "Version Control.accda")},
+        ),
+        patch("msaccess_vcs_mcp.tools.get_callback_url", return_value="http://localhost:1/cb"),
+        patch("msaccess_vcs_mcp.tools._get_operation_manager", return_value=op_manager),
+        patch("msaccess_vcs_mcp.tools._check_database_busy", return_value=None),
+    ):
+        from msaccess_vcs_mcp.tools import vcs_run_tests
+
+        result = asyncio.run(_unwrap(vcs_run_tests)(db_path, filter=filter_value))
+
+    return result, mock_app, mock_addin, op_manager
+
+
+class TestRunTestsAsync:
+    """Tests for the APIAsync callback path."""
+
+    def test_loads_results_path_on_complete(self, tmp_path):
+        result, _, mock_addin, _ = _call_run_tests_async(
+            tmp_path,
+            completion={"success": True, "message": "Operation completed successfully"},
+            results=SAMPLE_RESULTS_ALL_PASS,
+        )
+
+        assert result["success"] is True
+        assert result["summary"]["subs"] == 5
+        mock_addin.call_async.assert_called_once()
+        assert mock_addin.call_async.call_args[0][1] == "RunFilteredTests"
+        mock_addin.call_sync.assert_called_once_with("SetOption", "DefaultTestFilter", "")
+
+    def test_failed_suite_still_returns_json(self, tmp_path):
+        """eorFailed posts type error; results_path still carries the suite JSON."""
+        result, _, _, _ = _call_run_tests_async(
+            tmp_path,
+            completion={"success": False, "error": "Operation failed"},
+            results=SAMPLE_RESULTS_WITH_FAILURE,
+        )
+
+        assert result["success"] is False
+        assert result["summary"]["failed"] == 2
+        assert "tests" in result
+        assert "error" not in result or result.get("summary")
+
+    def test_sync_fallback_parses_wrapped_result(self, tmp_path):
+        mock_app, mock_conn, mock_addin = _build_mocks(tmp_path)
+        mock_addin.call_async.return_value = {
+            "sync": True,
+            "result": json.dumps(SAMPLE_RESULTS_ALL_PASS),
+        }
+
+        op_manager = MagicMock()
+        op_manager.register_operation.return_value = ("op-1", MagicMock())
+        op_manager.create_callback_info.return_value = "{}"
+
+        db_path = str(tmp_path / "test.accdb")
+        (tmp_path / "test.accdb").touch()
+
+        with (
+            patch("msaccess_vcs_mcp.tools.AccessConnection", return_value=mock_conn),
+            patch("msaccess_vcs_mcp.tools.VCSAddinIntegration", return_value=mock_addin),
+            patch("msaccess_vcs_mcp.tools.validate_database_path", return_value=tmp_path / "test.accdb"),
+            patch(
+                "msaccess_vcs_mcp.tools.get_config",
+                return_value={"ACCESS_VCS_ADDIN_PATH": str(tmp_path / "Version Control.accda")},
+            ),
+            patch("msaccess_vcs_mcp.tools.get_callback_url", return_value="http://localhost:1/cb"),
+            patch("msaccess_vcs_mcp.tools._get_operation_manager", return_value=op_manager),
+            patch("msaccess_vcs_mcp.tools._check_database_busy", return_value=None),
+        ):
+            from msaccess_vcs_mcp.tools import vcs_run_tests
+
+            result = asyncio.run(_unwrap(vcs_run_tests)(db_path))
+
+        assert result["success"] is True
+        assert result["summary"]["subs"] == 5
+        op_manager.unregister_operation.assert_called_once_with("op-1")
+        op_manager.wait_for_completion.assert_not_called()

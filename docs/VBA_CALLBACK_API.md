@@ -90,6 +90,10 @@ Public Function APIAsync(strCallbackInfo As String, strCommand As String, _
         Case "MergeBuild"
             StartAsyncMergeBuild callbackUrl, operationId
             APIAsync = "{""async"":true,""timeout_ms"":300000}"
+
+        Case "RunFilteredTests"
+            StartAsyncTestRun callbackUrl, operationId
+            APIAsync = "{""async"":true,""timeout_ms"":600000}"
             
         Case Else
             ' Fall back to sync for commands that don't need async
@@ -212,7 +216,7 @@ End Function
 
 VBA may reset `progress`/`total` at each category (28/30 queries, then 1/50 modules). The MCP server does **not** forward those values as MCP `progress`/`total`. It emits a strictly increasing sequence and keeps the VBA counts in the human-readable message. Log callbacks use the same reporter. Deprecated MCP logging notifications (`notifications/message`) are not used. The final tool result still includes `log_messages` and `log_path`.
 
-Cursor 3.13 often shows only "Running..." for those notifications. The `msaccess-vcs` CLI prints each update to stdout as it arrives.
+Cursor 3.13 often shows only "Running..." for those notifications. The `msaccess-vcs` CLI prints each update to stdout as it arrives (`rebuild-addin`, `export`, `merge`, `rebuild-database`, `run-tests`). For `run-tests`, the CLI turns each start-of-test progress callback into a pytest-style dot and prints a named line only for tests ≥ 1s and for FAIL/ERROR/EMPTY.
 
 ### Add-in self-rebuild
 
@@ -253,6 +257,11 @@ Supported levels: `debug`, `info`, `warning`, `error`
     "message": "Export completed successfully"
 }
 ```
+
+Test runs attach `log_path` and `results_path` on **complete, error, and cancelled**.
+Failed tests finish as `eorFailed` (type `error`) but still write the
+`TestResults_*.json` file; MCP loads that path rather than treating
+"Operation failed" as a lost result.
 
 ### Error Callback
 

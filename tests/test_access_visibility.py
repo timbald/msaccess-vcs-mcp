@@ -124,7 +124,11 @@ class TestAccessConnectionVisibility:
             AccessConnection(DB)._get_access_app()
 
         assert app.Visible is True
+        assert app.UserControl is True
         assert app.events.index(f"Open={DB}") < app.events.index("Visible=True")
+        assert app.events.index("Visible=True") < app.events.index("UserControl=True")
+        open_idx = app.events.index(f"Open={DB}")
+        assert all(not event.startswith("UserControl=") for event in app.events[:open_idx])
 
     def test_instance_we_attach_to_becomes_visible(self):
         """Moniker binding launches Access hidden when nothing had the file open."""
@@ -136,3 +140,29 @@ class TestAccessConnectionVisibility:
             AccessConnection(DB)._get_access_app()
 
         assert app.Visible is True
+        assert app.UserControl is False
+
+
+class TestAccessConnectionClose:
+    def _owned_connection(self, app):
+        conn = AccessConnection.__new__(AccessConnection)
+        conn._app = app
+        conn._db = None
+        conn._owns_app = True
+        conn._owns_db = False
+        conn._db_opened_via_getobject = False
+        conn._db_opened_as_current = False
+        return conn
+
+    def test_owned_instance_is_quit_by_default(self):
+        app = MagicMock()
+        self._owned_connection(app).close()
+        app.CloseCurrentDatabase.assert_called_once()
+        app.Quit.assert_called_once()
+
+    def test_leave_access_open_skips_quit(self, monkeypatch):
+        monkeypatch.setenv("ACCESS_VCS_LEAVE_ACCESS_OPEN", "true")
+        app = MagicMock()
+        self._owned_connection(app).close()
+        app.CloseCurrentDatabase.assert_not_called()
+        app.Quit.assert_not_called()

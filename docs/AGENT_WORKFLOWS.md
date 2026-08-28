@@ -295,6 +295,19 @@ do not add a second timer wait, fixed-duration sleep, or
 vcs_run_tests(r"C:\path\to\msaccess-vcs-addin\Version Control.accda", filter="clsTestInstall")
 ```
 
+MCP progress is best-effort in Cursor. For live per-test output:
+
+```text
+msaccess-vcs run-tests "C:\path\to\msaccess-vcs-addin\Version Control.accda" --filter clsTestInstall
+```
+
+Keep the CLI in the foreground so its stream stays in the primary chat. It
+exits when the run finishes; that process exit is the completion signal.
+The stream is dots for fast passes, a named line for tests ≥ 1s, and
+full FAIL/ERROR/EMPTY lines. The last stdout line is a human summary such as
+`Tests passed. 12 subs, 40 assertions in 1.48s`. Headless means no add-in UI
+(no web runner, no console form), not a hidden Access window.
+
 **Why the path is the development copy:** a run needs two projects and they are different files. The installed add-in loads as a library and supplies the runner and `TestAssert`; the code under test is whatever the current database holds. The runner scans the current VBA project, so the host decides which tests are found — aim the call at a user database, or anything in the repository's `Testing` folder, and you get that database's tests. Access will not bind a file moniker to an `.accda`, so the server opens the development copy as the current database explicitly; you do not need to open it first.
 
 **The installed add-in is never a target.** No tool accepts it as `database_path`, `output_path`, or `template_path` — not this one, not export, import, rebuild, `vcs_run_vba`, or `vcs_call_vba`. That file exists to be loaded as a library: opening it as a database, or writing into it, resets a VBA project while it is executing. It also has no source tree beside it for the tests that read one. The check runs before the Access gate and any COM work, and returns `error_pattern: installed_addin_refused`; the add-in refuses such a run itself, so the server's refusal is the earlier of two. `vcs_get_version_info()` reports the installed version without opening anything. The comparison ignores the extension, because a compiled install is a `.accde` built from the same `.accda`.

@@ -310,6 +310,7 @@ msaccess-vcs export C:\db.accdb C:\src --full
 msaccess-vcs merge C:\db.accdb C:\src
 msaccess-vcs rebuild-database C:\src C:\out.accdb
 msaccess-vcs rebuild-addin C:\path\to\msaccess-vcs-addin\Version Control.accda.src
+msaccess-vcs run-tests C:\path\to\msaccess-vcs-addin\Version Control.accda --filter clsTestInstall
 ```
 
 #### Running the add-in's own tests

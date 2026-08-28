@@ -87,6 +87,7 @@ Two rules follow from that, both enforced in `access_com/connection.py`:
 
 - Open databases through `open_current_database(app, path)`, never a bare `app.OpenCurrentDatabase(...)`. It lowers `Application.UserControl` across the open — `OpenCurrentDatabase` runs the target's AutoExec, and the add-in's own `AutoRun` opens its installer form when that flag says a person is watching, stranding the instance the server is about to drive — and it shows the window afterwards.
 - Show the window *after* the database opens, via `ensure_access_visible(app)`. Making a window visible can itself set `UserControl`, which is why the order is not interchangeable.
+- After that, instances the server created also get `UserControl = True` so the window is a normal interactive Access app. `Visible` alone is not enough on a COM-created process.
 
 The one deliberate exception is `validate_access_installation()` in `config.py`: it opens no database and quits immediately, so a window would only flash on screen with nothing to act on.
 
@@ -107,6 +108,7 @@ Key variables:
 - `ACCESS_VCS_REBUILD_TIMEOUT_SEC` — how long `vcs_rebuild_addin` waits after launch for a terminal status (default 1200s)
 - `ACCESS_VCS_BUSY_WAIT_SEC` — how long a second tool call waits for the Access gate before returning `server_busy` (default 15s)
 - `ACCESS_VCS_RECOVERY_PROBE_TIMEOUT_SEC` — timeout for automatic Access/add-in recovery probes after a VBA timeout or COM disconnect (default 10s)
+- `ACCESS_VCS_LEAVE_ACCESS_OPEN` — when `true`, a COM-created Access instance is not Quit on disconnect so a later attach can reuse the boosted process. Default is to Quit owned instances.
 
 One MCP server process is shared across all Cursor windows. Sync tools run in a single COM apartment thread with one Access operation at a time. A long call in one window causes others to get `error_pattern: server_busy` with `busy_with` naming the in-flight tool — retry rather than waiting for a client `-32001` timeout. After any client timeout, call `vcs_get_recent_calls()` to see what actually executed.
 
@@ -146,6 +148,8 @@ A run needs two projects and they are different files: the installed add-in load
 The installed add-in is refused as a host (see below); it also has no source tree beside it for the tests that read one. The add-in refuses such a run itself in `ExecuteTests` via `modInstall.CurrentDbIsInstalledAddIn`, so the server's refusal is the earlier of two.
 
 `AccessConnection` opens the development copy itself (Access refuses to bind a file moniker to an `.accda`, so `GetObject` fails and the explicit `OpenCurrentDatabase` fallback in `_open_as_current_database` takes over), so no manual pre-open is needed.
+
+MCP progress notifications are best-effort in Cursor. For live per-test output, run `msaccess-vcs run-tests <database>` from a terminal and keep that command in the foreground, the same way as `rebuild-addin`. The CLI prints pytest-style dots for fast passes, names tests that take a second or more, then a human completion line; it does not dump the full `tests` map. Headless means no add-in UI, not a hidden Access window.
 
 ### The installed add-in is never a target
 

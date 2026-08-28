@@ -433,17 +433,21 @@ class OperationManager:
                             "message": message,
                             "result": callback.get("result"),
                             "log_path": callback.get("log_path"),
+                            "results_path": callback.get("results_path"),
                             "log_messages": log_messages if log_messages else None
                         }
                         
                     elif msg_type == "error":
-                        # Operation failed
+                        # Operation failed. Test runs still attach results_path
+                        # here: failed assertions complete as eorFailed.
                         logger.error(f"Operation {operation_id} failed: {message}")
                         return {
                             "success": False,
                             "error": message,
                             "code": callback.get("code"),
-                            "log_path": callback.get("log_path")
+                            "log_path": callback.get("log_path"),
+                            "results_path": callback.get("results_path"),
+                            "result": callback.get("result"),
                         }
                     
                     elif msg_type == "cancelled":
@@ -452,7 +456,10 @@ class OperationManager:
                         return {
                             "success": False,
                             "cancelled": True,
-                            "message": message or "Operation cancelled"
+                            "message": message or "Operation cancelled",
+                            "log_path": callback.get("log_path"),
+                            "results_path": callback.get("results_path"),
+                            "result": callback.get("result"),
                         }
                     
                     else:

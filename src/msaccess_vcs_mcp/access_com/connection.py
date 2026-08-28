@@ -240,7 +240,9 @@ class AccessConnection:
         Whichever route wins, the instance ends up visible: a dialog or a
         VBA break in a hidden window is unresolvable by the person who has
         to resolve it.  That happens last, once the database is open, for
-        the ``UserControl`` reason in ``open_current_database``.
+        the ``UserControl`` reason in ``open_current_database``.  Instances
+        we created also get ``UserControl = True`` afterwards so the window
+        is a normal interactive Access app, not an automation ghost.
         """
         if self._app is None:
             try:
@@ -256,7 +258,22 @@ class AccessConnection:
 
                 prefer_full_power_app(self._app)
             ensure_access_visible(self._app)
+            if self._owns_app:
+                self._ensure_owned_instance_interactive()
         return self._app
+
+    def _ensure_owned_instance_interactive(self) -> None:
+        """Give a COM-created Access instance a normal interactive window.
+
+        ``Visible = True`` alone often leaves an automation-created process
+        out of the desktop. ``UserControl`` after the database is open does
+        not retrigger AutoExec -- that already ran with the flag down.
+        Best-effort: never fail the operation over this.
+        """
+        try:
+            self._app.UserControl = True
+        except Exception as e:
+            print(f"Could not set Access UserControl: {e}", file=sys.stderr)
 
     def _open_as_current_database(self, app):
         """Make ``self._db_path`` the instance's current database.
@@ -422,7 +439,9 @@ class AccessConnection:
         IMPORTANT: This method respects ownership:
         - If we connected to an existing Access instance (via GetObject), we do NOT
           close Access or the database - the user is still using them!
-        - If we created our own Access instance, we clean it up properly.
+        - If we created our own Access instance, we clean it up properly
+          unless ACCESS_VCS_LEAVE_ACCESS_OPEN is set. That flag releases COM
+          without Quit so a later attach can reuse the boosted process.
         """
         # Only close the database if we opened it ourselves
         if self._db is not None and self._owns_db:
@@ -433,7 +452,12 @@ class AccessConnection:
         self._db = None
         
         # Only quit Access if we created it ourselves
-        if self._app is not None and self._owns_app:
+        leave_open = os.environ.get("ACCESS_VCS_LEAVE_ACCESS_OPEN", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if self._app is not None and self._owns_app and not leave_open:
             try:
                 self._app.CloseCurrentDatabase()
             except Exception:
