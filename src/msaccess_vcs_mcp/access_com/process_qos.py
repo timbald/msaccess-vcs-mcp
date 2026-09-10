@@ -19,11 +19,13 @@ import csv
 import ctypes
 import subprocess
 import sys
+import time
 from io import StringIO
 from typing import Any
 
 PROCESS_SET_INFORMATION = 0x0200
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+PROCESS_TERMINATE = 0x0001
 PROCESS_POWER_THROTTLING = 4
 PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
 PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
@@ -62,6 +64,8 @@ def _kernel32():
     kernel32.SetProcessInformation.restype = ctypes.c_bool
     kernel32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
     kernel32.SetPriorityClass.restype = ctypes.c_bool
+    kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel32.TerminateProcess.restype = ctypes.c_bool
     kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
     kernel32.CloseHandle.restype = ctypes.c_bool
     _kernel32_mod = kernel32
@@ -173,8 +177,14 @@ def prefer_full_power_if_created(app: Any) -> bool:
     return prefer_full_power_app(app)
 
 
-def list_access_pids() -> set[int]:
-    """Return PIDs of running ``MSACCESS.EXE`` processes. Best-effort."""
+def list_access_pids_or_none() -> set[int] | None:
+    """Return PIDs of running ``MSACCESS.EXE``, or None when unknowable.
+
+    ``None`` means the query itself failed, which is not the same as "no
+    Access is running".  The owned-instance registry prunes on this set,
+    and treating a failed ``tasklist`` as an empty result would forget
+    every window the server created.
+    """
     if sys.platform != "win32":
         return set()
     try:
@@ -186,7 +196,10 @@ def list_access_pids() -> set[int]:
             check=False,
         )
     except Exception:
-        return set()
+        return None
+
+    if result.returncode != 0:
+        return None
 
     stdout = result.stdout or ""
     if not stdout.strip() or "No tasks" in stdout or stdout.lstrip().startswith("INFO:"):
@@ -208,6 +221,61 @@ def list_access_pids() -> set[int]:
         except ValueError:
             continue
     return pids
+
+
+def list_access_pids() -> set[int]:
+    """Return PIDs of running ``MSACCESS.EXE`` processes. Best-effort.
+
+    A failed query reports an empty set. Callers that must not confuse
+    "query failed" with "nothing running" use ``list_access_pids_or_none``.
+    """
+    pids = list_access_pids_or_none()
+    return set() if pids is None else pids
+
+
+def process_is_alive(pid: int) -> bool | None:
+    """True/False when ``pid`` liveness is known, None when it is not."""
+    pids = list_access_pids_or_none()
+    if pids is None:
+        return None
+    return int(pid) in pids
+
+
+def terminate_pid(pid: int) -> bool:
+    """Force-terminate ``pid``. Returns True when the process is gone.
+
+    Last resort for a server-created Access instance that failed both a
+    recovery probe and a time-bounded ``Quit``. Callers must verify the
+    PID belongs to an instance the server created before calling this.
+    """
+    if sys.platform != "win32" or not pid or pid <= 0:
+        return False
+
+    kernel32 = _kernel32()
+    handle = kernel32.OpenProcess(PROCESS_TERMINATE, False, int(pid))
+    if not handle:
+        # Already gone is success; anything else we cannot confirm.
+        return process_is_alive(pid) is False
+    try:
+        ok = bool(kernel32.TerminateProcess(handle, 1))
+    except Exception:
+        return False
+    finally:
+        kernel32.CloseHandle(handle)
+
+    if not ok:
+        return False
+
+    # TerminateProcess is asynchronous; confirm the process actually exited.
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        alive = process_is_alive(pid)
+        if alive is False:
+            return True
+        if alive is None:
+            return False
+        time.sleep(0.2)
+    return False
 
 
 def prefer_full_power_new_access(known_pids: set[int]) -> set[int]:

@@ -117,6 +117,14 @@ class TestAccessConnectionVisibility:
         with (
             patch.object(conn_mod, "win32com") as mock_win32com,
             patch.object(conn_mod, "gencache") as mock_gencache,
+            patch(
+                "msaccess_vcs_mcp.access_com.process_qos.list_access_pids_or_none",
+                return_value=set(),
+            ),
+            patch(
+                "msaccess_vcs_mcp.access_com.process_qos.pid_from_access_app",
+                return_value=4242,
+            ),
         ):
             mock_win32com.client.GetObject.side_effect = Exception("no moniker")
             mock_gencache.EnsureDispatch.return_value = app
@@ -130,9 +138,15 @@ class TestAccessConnectionVisibility:
         open_idx = app.events.index(f"Open={DB}")
         assert all(not event.startswith("UserControl=") for event in app.events[:open_idx])
 
-    def test_instance_we_attach_to_becomes_visible(self):
-        """Moniker binding launches Access hidden when nothing had the file open."""
+    def test_instance_we_attach_to_becomes_visible(self, monkeypatch):
+        """A user's window is shown but left as the user's.
+
+        ``UserControl`` stays untouched: raising it is how the server marks
+        an instance it created, and doing so here would be a lie the
+        closure path could act on.
+        """
         app = _FakeApp(current_db_name=DB)
+        monkeypatch.setattr(conn_mod, "access_instance_is_live", lambda _p: True)
 
         with patch.object(conn_mod, "win32com") as mock_win32com:
             mock_win32com.client.GetObject.return_value = app
@@ -141,6 +155,32 @@ class TestAccessConnectionVisibility:
 
         assert app.Visible is True
         assert app.UserControl is False
+
+    def test_instance_launched_by_moniker_bind_is_ours(self, monkeypatch):
+        """Binding a moniker starts Access when nothing has the file open.
+
+        That process is the server's, so it gets the interactive treatment
+        and a registry claim -- otherwise nothing could ever close it.
+        """
+        app = _FakeApp(current_db_name=DB)
+        monkeypatch.setattr(conn_mod, "access_instance_is_live", lambda _p: False)
+
+        with (
+            patch.object(conn_mod, "win32com") as mock_win32com,
+            patch(
+                "msaccess_vcs_mcp.access_com.process_qos.pid_from_access_app",
+                return_value=4242,
+            ),
+            patch("msaccess_vcs_mcp.access_com.process_qos.prefer_full_power_app"),
+        ):
+            mock_win32com.client.GetObject.return_value = app
+
+            conn = AccessConnection(DB)
+            conn._get_access_app()
+
+        assert conn._owns_app is True
+        assert app.Visible is True
+        assert app.UserControl is True
 
 
 class TestAccessConnectionClose:
@@ -154,13 +194,20 @@ class TestAccessConnectionClose:
         conn._db_opened_as_current = False
         return conn
 
-    def test_owned_instance_is_quit_by_default(self):
+    def test_owned_instance_is_left_open_by_default(self):
+        app = MagicMock()
+        self._owned_connection(app).close()
+        app.CloseCurrentDatabase.assert_not_called()
+        app.Quit.assert_not_called()
+
+    def test_leave_access_open_false_quits(self, monkeypatch):
+        monkeypatch.setenv("ACCESS_VCS_LEAVE_ACCESS_OPEN", "false")
         app = MagicMock()
         self._owned_connection(app).close()
         app.CloseCurrentDatabase.assert_called_once()
         app.Quit.assert_called_once()
 
-    def test_leave_access_open_skips_quit(self, monkeypatch):
+    def test_leave_access_open_true_skips_quit(self, monkeypatch):
         monkeypatch.setenv("ACCESS_VCS_LEAVE_ACCESS_OPEN", "true")
         app = MagicMock()
         self._owned_connection(app).close()

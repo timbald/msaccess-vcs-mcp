@@ -36,7 +36,9 @@ All business logic lives in VBA. The MCP layer validates inputs, manages async l
 
 ### Access windows are visible
 
-When a tool needs Access, the window is shown rather than kept hidden — expect an Access window to appear if one isn't already open. This is intentional: Access asks questions that only a person can answer (trust prompts, "convert this database?", a VBA error breaking into the debugger), and an operation that stalls behind an invisible dialog looks like a hang with no way to clear it. The server never closes an Access window it did not open.
+When a tool needs Access, the window is shown rather than kept hidden — expect an Access window to appear if one isn't already open. This is intentional: Access asks questions that only a person can answer (trust prompts, "convert this database?", a VBA error breaking into the debugger), and an operation that stalls behind an invisible dialog looks like a hang with no way to clear it. The server never closes an Access window it did not open. Instances it created stay open across tool calls so merge / test / edit loops reuse the same process; you close the window when you are done. The server closes a window it created only when a rebuild must replace a file it holds, when recycling a stuck owned instance, or when `ACCESS_VCS_LEAVE_ACCESS_OPEN=false`.
+
+Which windows are the server's own is recorded on disk, keyed by process id *and* creation time, so it survives a server restart and cannot be fooled by Windows reusing a process id. Anything it cannot positively confirm is treated as yours and left alone. A server-created instance that ignores the request to close within `ACCESS_VCS_CLOSE_TIMEOUT_SEC` is force-terminated, which only ever applies to a process the server started.
 
 ## Prerequisites
 
@@ -297,7 +299,7 @@ vcs_rebuild_addin(r"C:\path\to\msaccess-vcs-addin\Version Control.accda.src")
 
 Do not poll the status file yourself unless the tool timed out. `vcs_call_vba(..., ["RebuildAddIn", source])` remains a launch-only escape hatch.
 
-The rebuild refuses when another `MSACCESS.EXE` in the Windows session holds one of the files it replaces — it checks the loaded VBA projects in each one, so an instance with an unrelated database open is left alone. An instance that cannot be asked also blocks it. It never closes another Access process. On refusal, `otherInstances` names each process and which file it holds.
+Before launch the server closes Access windows **it created** that hold a file the rebuild replaces. Because every tool call loads the add-in as a library, and that locks the file, this includes server-created instances with an unrelated database open. The close runs inside the Access gate, so another window's tool call cannot reopen the file between the close and the launch. The rebuild still refuses when a **user-owned** `MSACCESS.EXE` holds one of those files — it checks the loaded VBA projects in each one, so an instance with an unrelated database open is left alone. An instance that cannot be asked also blocks it. The add-in never closes another Access process. On refusal, `otherInstances` names each process and which file it holds.
 
 `refused` and `launch-failed` come back immediately and mean nothing was rebuilt. `launch-failed` means the helper script never started; Access is left open and the call is safe to retry.
 

@@ -92,8 +92,15 @@ def _cleanup_session() -> None:
     if not session_id or not db_path:
         return
     try:
-        from .access_com.connection import AccessConnection
+        from .access_com.connection import AccessConnection, access_instance_is_live
         from .addin_integration import VCSAddinIntegration
+        if not access_instance_is_live(db_path):
+            print(
+                f"Session {session_id}: overrides left on disk "
+                "(no live Access instance)",
+                file=sys.stderr,
+            )
+            return
         config = get_config()
         with AccessConnection(db_path) as conn:
             app, db = conn.connect()

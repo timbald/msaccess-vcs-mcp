@@ -87,6 +87,7 @@ def test_prefer_full_power_if_created_promotes_empty_instance():
 def test_list_access_pids_parses_tasklist(monkeypatch):
     monkeypatch.setattr(process_qos.sys, "platform", "win32")
     completed = MagicMock()
+    completed.returncode = 0
     completed.stdout = '"MSACCESS.EXE","1111","Console","1","50 K"\n"MSACCESS.EXE","2222","Console","1","50 K"\n'
     with patch.object(process_qos.subprocess, "run", return_value=completed):
         assert process_qos.list_access_pids() == {1111, 2222}
@@ -95,9 +96,36 @@ def test_list_access_pids_parses_tasklist(monkeypatch):
 def test_list_access_pids_empty(monkeypatch):
     monkeypatch.setattr(process_qos.sys, "platform", "win32")
     completed = MagicMock()
+    completed.returncode = 0
     completed.stdout = "INFO: No tasks are running which match the specified criteria.\n"
     with patch.object(process_qos.subprocess, "run", return_value=completed):
         assert process_qos.list_access_pids() == set()
+
+
+def test_failed_query_is_unknown_not_empty(monkeypatch):
+    """"tasklist failed" and "no Access running" are different answers.
+
+    The ownership registry prunes on this result, so conflating them would
+    make the server forget every window it created.
+    """
+    monkeypatch.setattr(process_qos.sys, "platform", "win32")
+    with patch.object(process_qos.subprocess, "run", side_effect=OSError("boom")):
+        assert process_qos.list_access_pids_or_none() is None
+        assert process_qos.list_access_pids() == set()
+
+    completed = MagicMock()
+    completed.returncode = 1
+    completed.stdout = ""
+    with patch.object(process_qos.subprocess, "run", return_value=completed):
+        assert process_qos.list_access_pids_or_none() is None
+
+
+def test_process_is_alive_reports_unknown(monkeypatch):
+    with patch.object(process_qos, "list_access_pids_or_none", return_value=None):
+        assert process_qos.process_is_alive(1111) is None
+    with patch.object(process_qos, "list_access_pids_or_none", return_value={1111}):
+        assert process_qos.process_is_alive(1111) is True
+        assert process_qos.process_is_alive(2222) is False
 
 
 def test_prefer_full_power_new_access_skips_known():

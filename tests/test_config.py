@@ -106,8 +106,9 @@ class TestStripQuotes:
         assert _strip_quotes("''") == ""
 
 
+@pytest.mark.integration
 def test_validate_access_installation():
-    """Test Access COM validation."""
+    """Test Access COM validation (launches Access; requires it installed)."""
     from msaccess_vcs_mcp.config import validate_access_installation
     
     # This test will only pass if Access is installed

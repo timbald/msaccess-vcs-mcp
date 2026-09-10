@@ -14,9 +14,11 @@ import os
 import re
 import shutil
 import sys
+import threading
 from typing import Any
 
 try:
+    import pythoncom
     import win32com.client
     from win32com.client import gencache
     COM_AVAILABLE = True
@@ -123,6 +125,17 @@ def _paths_match(a: str, b: str) -> bool:
         return False
 
 
+def leave_access_open() -> bool:
+    """True unless ACCESS_VCS_LEAVE_ACCESS_OPEN is an explicit false.
+
+    Default is to leave a COM-created Access window running so later
+    calls reattach instead of spawning a new process. Set the env var
+    to ``false`` / ``0`` / ``no`` to restore quit-per-call.
+    """
+    raw = os.environ.get("ACCESS_VCS_LEAVE_ACCESS_OPEN", "true").strip().lower()
+    return raw not in ("0", "false", "no")
+
+
 def ensure_access_visible(app) -> bool:
     """Show the Access window for any instance we drive a database through.
 
@@ -184,6 +197,206 @@ def open_current_database(app, db_path: str) -> None:
     ensure_access_visible(app)
 
 
+def access_instance_is_live(db_path: str) -> bool:
+    """True when an Access process already has ``db_path`` open.
+
+    Uses the Running Object Table only -- it does not bind a file moniker
+    and therefore cannot spawn a new instance.
+    """
+    from ..addin_integration import VCSAddinIntegration
+
+    return VCSAddinIntegration._find_access_in_rot(db_path) is not None
+
+
+DEFAULT_CLOSE_TIMEOUT_SEC = 10.0
+
+
+def get_close_timeout() -> float:
+    """Seconds to wait for a graceful Quit before force-terminating."""
+    try:
+        value = float(
+            os.environ.get(
+                "ACCESS_VCS_CLOSE_TIMEOUT_SEC", str(DEFAULT_CLOSE_TIMEOUT_SEC)
+            )
+        )
+    except ValueError:
+        return DEFAULT_CLOSE_TIMEOUT_SEC
+    return value if value > 0 else DEFAULT_CLOSE_TIMEOUT_SEC
+
+
+def _resolve_instance_for_record(record) -> Any:
+    """Return the COM object for ``record``, or None if it is not that process.
+
+    Both lookups resolve by path, which can land on a *different* Access
+    instance than the one recorded -- two processes can hold the same file,
+    and a moniker bind can even start a new one. The PID and creation stamp
+    are therefore re-checked before the caller is allowed to close anything.
+    """
+    from .instance_registry import process_create_time
+    from .process_qos import pid_from_access_app
+
+    if not COM_AVAILABLE:
+        return None
+
+    app = None
+    try:
+        app = win32com.client.GetObject(record.database_path)
+    except Exception:
+        from ..addin_integration import VCSAddinIntegration
+
+        app = VCSAddinIntegration._find_access_in_rot(record.database_path)
+    if app is None:
+        return None
+
+    pid = pid_from_access_app(app)
+    if pid != record.pid:
+        return None
+    if process_create_time(pid) != record.create_time:
+        return None
+    return app
+
+
+def _quit_with_timeout(app, timeout_sec: float) -> bool:
+    """Run CloseCurrentDatabase + Quit in a daemon thread with a hard timeout.
+
+    This runs against an instance that has usually just failed a health
+    probe, so the COM call may never return. A blocking call here would
+    hang the Access gate thread and take the whole server down with it.
+    """
+    done: dict[str, bool] = {}
+
+    def worker() -> None:
+        if COM_AVAILABLE:
+            try:
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
+        try:
+            try:
+                app.CloseCurrentDatabase()
+            except Exception:
+                pass
+            app.Quit()
+            done["ok"] = True
+        except Exception:
+            done["ok"] = False
+        finally:
+            if COM_AVAILABLE:
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+    thread = threading.Thread(target=worker, daemon=True, name="vcs-access-quit")
+    thread.start()
+    thread.join(timeout=timeout_sec)
+    return bool(done.get("ok"))
+
+
+def _close_owned_record(record) -> dict[str, Any] | None:
+    """Close one verified server-created instance. Returns a result or None.
+
+    Graceful Quit first; a hung instance is force-terminated, which is only
+    reachable for a PID whose identity was confirmed against the registry.
+    """
+    from .instance_registry import unregister_owned
+    from .process_qos import process_is_alive, terminate_pid
+
+    app = _resolve_instance_for_record(record)
+    if app is None:
+        # Either the process is gone, or the path now resolves to somebody
+        # else's instance. Drop a stale claim; never close what we cannot
+        # prove is ours.
+        if process_is_alive(record.pid) is False:
+            unregister_owned(record.pid, record.create_time)
+        else:
+            _log_instance_event(
+                "owned_instance_close_skipped",
+                pid=record.pid,
+                database=record.database_path,
+            )
+        return None
+
+    quit_ok = _quit_with_timeout(app, get_close_timeout())
+    app = None
+    terminated = False
+
+    if process_is_alive(record.pid) is not False:
+        terminated = terminate_pid(record.pid)
+        _log_instance_event(
+            "owned_instance_terminated",
+            pid=record.pid,
+            database=record.database_path,
+            succeeded=terminated,
+        )
+
+    if process_is_alive(record.pid) is not False and not terminated:
+        return None
+
+    unregister_owned(record.pid, record.create_time)
+    _log_instance_event(
+        "owned_instance_closed",
+        pid=record.pid,
+        database=record.database_path,
+        quit=quit_ok,
+        terminated=terminated,
+    )
+    return {
+        "pid": record.pid,
+        "database_path": record.database_path,
+        "quit": quit_ok,
+        "terminated": terminated,
+    }
+
+
+def _log_instance_event(event: str, **fields: Any) -> None:
+    try:
+        from ..usage_logging import log_diagnostic_event
+
+        log_diagnostic_event(event, **fields)
+    except Exception:
+        pass
+
+
+def close_owned_instances_holding(
+    paths: list[str] | tuple[str, ...],
+    addin_paths: list[str] | tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    """Quit server-created Access instances holding any of the given files.
+
+    ``paths`` matches an instance's open database; ``addin_paths`` also
+    matches a loaded add-in library, which locks its file even when the
+    instance has an unrelated database open. User-owned windows are never
+    touched. Used before rebuilds that must replace a file, and when
+    recycling a stuck owned instance.
+    """
+    from .instance_registry import owned_records_for_paths
+
+    closed: list[dict[str, Any]] = []
+    for record in owned_records_for_paths(paths, addin_paths):
+        result = _close_owned_record(record)
+        if result is not None:
+            closed.append(result)
+    return closed
+
+
+def recycle_owned_instance(database_path: str) -> bool:
+    """Close a server-owned instance for ``database_path`` and open a fresh one.
+
+    Returns True only when an owned instance was closed and a replacement
+    was started. User-owned windows are never touched.
+    """
+    from .instance_registry import owned_records_for_paths
+
+    if not owned_records_for_paths([database_path]):
+        return False
+    if not close_owned_instances_holding([database_path]):
+        return False
+    with AccessConnection(database_path) as conn:
+        conn.connect()
+    return True
+
+
 class AccessConnection:
     """
     Manages COM connection to Access database.
@@ -191,6 +404,8 @@ class AccessConnection:
     Uses ownership tracking to determine cleanup responsibility:
     - If connecting to user's existing Access instance, we don't close it
     - If we create our own Access instance, we're responsible for cleanup
+      (quit only when ACCESS_VCS_LEAVE_ACCESS_OPEN is explicitly false, or
+      when a rebuild / recycle must replace the file)
     """
     
     def __init__(self, db_path: str):
@@ -245,14 +460,24 @@ class AccessConnection:
         is a normal interactive Access app, not an automation ghost.
         """
         if self._app is None:
+            created_now = False
             try:
+                # A moniker bind *launches* Access when nothing has the file
+                # open, so whether an instance was already running decides
+                # whether the process below is ours. The ROT lookup only
+                # inspects the table -- it cannot start anything itself.
+                was_running = access_instance_is_live(self._db_path)
                 self._app = win32com.client.GetObject(self._db_path)
                 self._db_opened_via_getobject = True
-                self._owns_app = False
+                created_now = not was_running
             except Exception:
-                self._app = self._create_or_reuse_instance()
+                self._app, created_now = self._create_or_reuse_instance()
                 self._db_opened_via_getobject = False
+                # Never displace a user's database: only open on instances
+                # we just created (empty or isolated).
+                self._owns_app = created_now
                 self._open_as_current_database(self._app)
+            self._resolve_ownership(created_now)
             if self._owns_app:
                 from .process_qos import prefer_full_power_app
 
@@ -261,6 +486,25 @@ class AccessConnection:
             if self._owns_app:
                 self._ensure_owned_instance_interactive()
         return self._app
+
+    def _resolve_ownership(self, created_now: bool) -> None:
+        """Set ``_owns_app`` from creation or the durable PID registry.
+
+        GetObject on a left-open window would otherwise reclassify a
+        server-created instance as user-owned. The registry survives
+        process restarts; create_time rejects PID reuse.
+        """
+        from .instance_registry import is_owned, process_create_time, register_owned
+        from .process_qos import pid_from_access_app
+
+        pid = pid_from_access_app(self._app)
+        create_time = process_create_time(pid) if pid else None
+        if created_now:
+            self._owns_app = True
+            if pid:
+                register_owned(pid, self._db_path, create_time=create_time)
+            return
+        self._owns_app = bool(pid and is_owned(pid, create_time))
 
     def _ensure_owned_instance_interactive(self) -> None:
         """Give a COM-created Access instance a normal interactive window.
@@ -321,9 +565,17 @@ class AccessConnection:
 
         EnsureDispatch("Access.Application") can silently return an
         existing user-owned instance instead of creating a new one.
-        We must check whether the returned instance already has a
-        database open to set _owns_app correctly.
+        Returns ``(app, created_now)`` so the caller can register a new
+        process or look the PID up in the durable ownership registry.
+
+        Creation is decided by comparing the resulting PID against a
+        snapshot taken beforehand, not by whether the instance has a
+        database open. A user can leave Access sitting at an empty shell
+        with no current database, and that window is still theirs.
         """
+        from .process_qos import list_access_pids_or_none, pid_from_access_app
+
+        before = list_access_pids_or_none()
         app = ensure_dispatch("Access.Application")
 
         try:
@@ -333,8 +585,7 @@ class AccessConnection:
 
         if existing_db is not None:
             if _paths_match(existing_db.Name, self._db_path):
-                self._owns_app = False
-                return app
+                return app, False
             db_name = os.path.basename(self._db_path)
             other_name = os.path.basename(existing_db.Name)
             print(
@@ -342,10 +593,13 @@ class AccessConnection:
                 f"'{other_name}' open -- launching isolated instance via DispatchEx",
                 file=sys.stderr,
             )
-            return self._create_isolated_instance()
+            return self._create_isolated_instance(), True
 
-        self._owns_app = True
-        return app
+        if before is None:
+            # Cannot prove we created it; treat as the user's.
+            return app, False
+        pid = pid_from_access_app(app)
+        return app, bool(pid and pid not in before)
 
     def _create_isolated_instance(self):
         """Create a guaranteed-isolated Access process via DispatchEx.
@@ -358,7 +612,6 @@ class AccessConnection:
         """
         app = win32com.client.DispatchEx("Access.Application")
         app.UserControl = True
-        self._owns_app = True
         return app
     
     def _get_current_db(self):
@@ -439,9 +692,10 @@ class AccessConnection:
         IMPORTANT: This method respects ownership:
         - If we connected to an existing Access instance (via GetObject), we do NOT
           close Access or the database - the user is still using them!
-        - If we created our own Access instance, we clean it up properly
-          unless ACCESS_VCS_LEAVE_ACCESS_OPEN is set. That flag releases COM
-          without Quit so a later attach can reuse the boosted process.
+        - If we created our own Access instance, we leave it running by default
+          so later calls reattach. Set ACCESS_VCS_LEAVE_ACCESS_OPEN=false to
+          restore quit-per-call. Rebuild and recycle close owned instances
+          when they must replace the file.
         """
         # Only close the database if we opened it ourselves
         if self._db is not None and self._owns_db:
@@ -451,13 +705,14 @@ class AccessConnection:
                 pass
         self._db = None
         
-        # Only quit Access if we created it ourselves
-        leave_open = os.environ.get("ACCESS_VCS_LEAVE_ACCESS_OPEN", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        )
-        if self._app is not None and self._owns_app and not leave_open:
+        # Only quit Access if we created it ourselves AND the operator
+        # opted back into quit-per-call.
+        if self._app is not None and self._owns_app and not leave_access_open():
+            from .instance_registry import process_create_time, unregister_owned
+            from .process_qos import pid_from_access_app, process_is_alive
+
+            pid = pid_from_access_app(self._app)
+            create_time = process_create_time(pid) if pid else None
             try:
                 self._app.CloseCurrentDatabase()
             except Exception:
@@ -466,6 +721,11 @@ class AccessConnection:
                 self._app.Quit()
             except Exception:
                 pass
+            # Only drop the claim once the process is confirmed gone. A
+            # failed Quit that also forgot the PID would leave a live
+            # instance nobody can close or recycle later.
+            if pid and process_is_alive(pid) is False:
+                unregister_owned(pid, create_time)
         self._app = None
         
         # Reset ownership flags

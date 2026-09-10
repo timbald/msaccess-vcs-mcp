@@ -319,6 +319,167 @@ def test_run_vba_timeout_returns_recoverable(monkeypatch):
 # Recovery probe after prior timeout
 # ------------------------------------------------------------------
 
+def test_failed_probe_recycles_owned_instance_then_retries(monkeypatch):
+    get_recovery_manager().mark_failure(
+        "C:\\db.accdb",
+        "VBA worker timed out after 45 seconds",
+        "timeout",
+        timed_out=True,
+    )
+    results = [
+        {
+            "success": False,
+            "operation": "probe",
+            "phase": "connect",
+            "error": "Access is not responding",
+            "error_pattern": "access_unresponsive",
+        },
+        {
+            "success": True,
+            "operation": "probe",
+            "phase": "load_addin",
+            "result": "ok",
+        },
+        {
+            "success": True,
+            "operation": "run_vba",
+            "phase": "run_vba",
+            "result": "done",
+        },
+    ]
+    calls = _patch_worker_thread(monkeypatch, results)
+    recycle = Mock(return_value=True)
+    monkeypatch.setattr(worker_module, "recycle_owned_instance", recycle)
+
+    manager = VBAWorkerManager()
+    result = manager.run_vba(
+        database_path="C:\\db.accdb",
+        code='MCP_TempFunction = "done"',
+        timeout_seconds=1,
+    )
+
+    assert result["success"] is True
+    recycle.assert_called_once_with("C:\\db.accdb")
+    assert [c["operation"] for c in calls] == ["probe", "probe", "run_vba"]
+
+
+def test_failed_probe_does_not_recycle_user_owned_instance(monkeypatch):
+    get_recovery_manager().mark_failure(
+        "C:\\db.accdb",
+        "VBA worker timed out after 45 seconds",
+        "timeout",
+        timed_out=True,
+    )
+    results = [
+        {
+            "success": False,
+            "operation": "probe",
+            "phase": "connect",
+            "error": "Access is not responding",
+            "error_pattern": "access_unresponsive",
+        },
+    ]
+    calls = _patch_worker_thread(monkeypatch, results)
+    recycle = Mock(return_value=False)
+    monkeypatch.setattr(worker_module, "recycle_owned_instance", recycle)
+
+    manager = VBAWorkerManager()
+    result = manager.run_vba(
+        database_path="C:\\db.accdb",
+        code='MCP_TempFunction = "done"',
+        timeout_seconds=1,
+    )
+
+    assert result["success"] is False
+    assert result["error_pattern"] == "access_unresponsive"
+    assert "close and reopen" in result["hint"]
+    recycle.assert_called_once_with("C:\\db.accdb")
+    assert [c["operation"] for c in calls] == ["probe"]
+
+
+def test_real_worker_opens_access_when_rot_misses(monkeypatch):
+    events: list[str] = []
+
+    class FakeProject:
+        @property
+        def FullName(self):
+            events.append("barrier")
+            return "C:\\db.accdb"
+
+    class FakeApp:
+        def __init__(self):
+            self.CurrentProject = FakeProject()
+
+    app = FakeApp()
+    find_count = 0
+    opened: list[str] = []
+
+    class FakeIntegration:
+        def __init__(self, addin_path=None):
+            pass
+
+        @staticmethod
+        def _find_access_in_rot(database_path):
+            nonlocal find_count
+            find_count += 1
+            events.append(f"find:{find_count}")
+            if find_count == 1:
+                return None
+            return app
+
+        def load_addin(self, worker_app, db_path=None):
+            events.append("load")
+            return True
+
+        def call_sync(self, command, *args):
+            events.append(f"call:{command}")
+            if command == "ResetVbaProjectState":
+                return '{"success": true, "resetQueued": true}'
+            if command == "RunVBA":
+                return '{"success": true, "result": "ok"}'
+            raise AssertionError(f"Unexpected command: {command}")
+
+    class FakeConn:
+        def __init__(self, path):
+            opened.append(path)
+            events.append("open")
+
+        def connect(self):
+            return app, None
+
+        def close(self):
+            events.append("close")
+
+    fake_pythoncom = Mock()
+    monkeypatch.setattr(worker_module, "COM_AVAILABLE", True)
+    monkeypatch.setattr(worker_module, "pythoncom", fake_pythoncom)
+    monkeypatch.setattr(worker_module, "VCSAddinIntegration", FakeIntegration)
+    monkeypatch.setattr(worker_module, "AccessConnection", FakeConn)
+    monkeypatch.setattr(
+        worker_module,
+        "ensure_access_visible",
+        lambda _app: events.append("visible"),
+    )
+
+    result = VBAWorkerManager()._run_worker(
+        operation="run_vba",
+        database_path="C:\\db.accdb",
+        addin_path="C:\\addin.accda",
+        code='MCP_TempFunction = "ok"',
+        timeout_seconds=1,
+    )
+
+    assert result["success"] is True
+    assert opened == ["C:\\db.accdb"]
+    assert events[0:3] == ["find:1", "open", "find:2"]
+    # The connection stays open for the whole operation. Closing it at the
+    # end of the lookup would quit the instance under
+    # ACCESS_VCS_LEAVE_ACCESS_OPEN=false, and the very next ROT lookup
+    # would find nothing.
+    assert events.index("close") == len(events) - 1
+    assert "call:RunVBA" in events[: events.index("close")]
+
+
 def test_next_call_probes_after_prior_timeout(monkeypatch):
     get_recovery_manager().mark_failure(
         "C:\\db.accdb",

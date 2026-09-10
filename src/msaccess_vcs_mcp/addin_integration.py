@@ -208,7 +208,26 @@ class VCSAddinIntegration:
         
         self._app = app
         self._addin_loaded = True
+        self._note_addin_locked(app)
         return True
+
+    def _note_addin_locked(self, app) -> None:
+        """Record that this instance now holds the add-in file open.
+
+        A successful probe means the add-in is loaded as a library, which
+        locks the file. A rebuild that replaces it has to close every
+        server-created instance holding it, whatever database is open --
+        and this is the one place every load path passes through.
+        """
+        try:
+            from .access_com.instance_registry import note_loaded_addin
+            from .access_com.process_qos import pid_from_access_app
+
+            pid = pid_from_access_app(app)
+            if pid:
+                note_loaded_addin(pid, self.addin_path)
+        except Exception:
+            pass
     
     def _probe_with_timeout(self, app, db_path: Optional[str], timeout_sec: float) -> None:
         """

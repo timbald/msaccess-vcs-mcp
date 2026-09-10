@@ -41,7 +41,13 @@ from urllib.parse import unquote, urlparse
 
 from mcp.server.fastmcp import FastMCP, Context
 
-from .access_com.connection import AccessConnection, ensure_access_visible, ensure_dispatch
+from .access_com.connection import (
+    AccessConnection,
+    access_instance_is_live,
+    close_owned_instances_holding,
+    ensure_access_visible,
+    ensure_dispatch,
+)
 from .access_com.dao_helpers import list_query_defs, list_table_defs
 from .access_com.process_qos import list_access_pids, prefer_full_power_if_created
 from .access_gate import EXEMPT_TOOLS, get_access_gate
@@ -365,8 +371,9 @@ mcp = FastMCP(
         "this -- rebuilding the add-in is a repository operation and belongs to the "
         "repository's own copy. Prefer this over polling the status file yourself.\n"
         "`refused` and `launch-failed` are returned immediately and mean nothing was "
-        "rebuilt. The rebuild refuses when another MSACCESS.EXE in the Windows session "
-        "holds one of the files it replaces, and never closes another Access process. "
+        "rebuilt. Before launch the server closes Access windows it created that hold "
+        "a file the rebuild replaces. The rebuild still refuses when a user-owned "
+        "MSACCESS.EXE holds one of those files, and never closes another process. "
         "On refusal, `otherInstances` names each process and which file it holds; close "
         "those and call again. `launch-failed` means the helper script never started: "
         "Access is left open and the call is safe to retry.\n"
@@ -1334,6 +1341,7 @@ async def vcs_rebuild_database(
         
         # Check if target database is already busy (if it exists)
         if output_path:
+            close_owned_instances_holding([output_path])
             busy_error = _check_database_busy(output_path)
             if busy_error:
                 return busy_error
@@ -1469,6 +1477,10 @@ async def vcs_rebuild_addin(
     ``complete`` or a terminal failure. The Access gate is held only for
     the launch; other tools can run while the worker builds.
 
+    Before launch, the server closes Access windows it created that hold
+    the development copy or the installed add-in. User-owned windows are
+    left alone and still produce ``refused`` / ``otherInstances``.
+
     This is not ``vcs_rebuild_database``, which rebuilds a user project.
     ``vcs_call_vba(..., ["RebuildAddIn", source])`` remains a launch-only
     escape hatch and does not wait for the rebuild to finish.
@@ -1519,6 +1531,18 @@ async def vcs_rebuild_addin(
                 )
 
         async def _launch() -> dict[str, Any]:
+            # Inside the gate: another window's tool call could otherwise
+            # open a fresh instance between the close and the launch, and
+            # the rebuild would refuse on a file we had just freed.
+            # Every tool call loads the add-in as a library, which locks it
+            # regardless of which database that instance has open, so the
+            # installed path is matched against loaded libraries too.
+            installed = get_config().get("ACCESS_VCS_ADDIN_PATH")
+            close_owned_instances_holding(
+                [str(host_path)],
+                [str(installed)] if installed else [],
+            )
+
             call_args = ["RebuildAddIn", str(src_path)]
             if callback_info:
                 call_args.append(callback_info)
@@ -3083,7 +3107,18 @@ def vcs_end_session(
     try:
         db_path = validate_database_path(database_path)
         session_id = get_session_id() or "default"
-        
+
+        # The add-in clears session overrides on the running instance. With
+        # no instance running there is nothing to clear, and launching one
+        # just to end a session is the opposite of what this tool is for --
+        # shutdown calls it unconditionally.
+        if not access_instance_is_live(str(db_path)):
+            return {
+                "success": True,
+                "session_id": session_id,
+                "message": "No live Access instance; session overrides left on disk",
+            }
+
         with AccessConnection(str(db_path)) as conn:
             app, db = conn.connect()
             

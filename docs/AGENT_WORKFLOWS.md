@@ -315,7 +315,7 @@ full FAIL/ERROR/EMPTY lines. The last stdout line is a human summary such as
 **Tips:**
 - Run through the MCP server, not from the add-in's own window; assertions route to the installed add-in while the runner lives in the calling project, so a development-copy run discards them all
 - An all-`EMPTY` result (zero assertions) is a bypassed harness, not a pass
-- A rebuild ends with no Access process running, so expect a cold start on the next call
+- A rebuild closes server-owned Access that held the files it replaces, so expect a cold start on the next call
 
 ### 7. Iterative Development Cycle
 

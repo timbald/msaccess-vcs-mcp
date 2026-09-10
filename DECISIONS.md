@@ -74,7 +74,98 @@ contradictory guidance.
 
 ---
 
+## 2026-09-10 — Persist server-created Access; own it by PID
+
+**Trigger**: Merge / test / edit loops were spawning a new `MSACCESS.EXE` per
+tool call. Attach costs ~3 ms; spawn+quit costs ~3 s median. Ninety-seven
+`vcs_run_vba` / import / test calls failed with "Cannot find Access instance"
+because the worker only looks in the ROT. `_owns_app` is recomputed per
+connection, so leaving a window open reclassified it as user-owned.
+
+**Options explored**:
+- *Keep quit-per-call, document `ACCESS_VCS_LEAVE_ACCESS_OPEN`.* Rejected.
+  The flag already existed and was unused in this workspace; the reliability
+  failures are the default path.
+- *In-memory owned-PID set.* Rejected. The server restarts a median of every
+  6.8 minutes; an in-memory set would orphan windows several times an hour.
+- *Never Quit when UserControl is True.* Still rejected: owned instances
+  deliberately set `UserControl` so they look interactive.
+- *Persist by default + disk PID registry* (chosen). GetObject reattaches, so
+  the bound is one window per distinct database, not an accumulating leak.
+  Rebuild pre-flight closes registry-owned holders; user-owned still refuse.
+  Stuck owned instances are recycled after a failed recovery probe.
+
+**Decision**: Default `ACCESS_VCS_LEAVE_ACCESS_OPEN` to true. Record
+`(pid, create_time, database_path)` in `~/.msaccess-vcs-mcp/owned-instances.json`.
+`_owns_app` now means "the server created this process and may close it when
+it must," not "quit at end of call."
+
+**What this rules out**: Quitting a leftover owned instance at the end of
+every tool call. Revisit if long-lived Access shows a correctness problem
+(stale VBA project, memory growth) that in-process reset cannot fix.
+
+**Relevant files**: `access_com/instance_registry.py`,
+`access_com/connection.py`, `vba_worker_manager.py`, `tools.py`, `main.py`.
+
+---
+
+## 2026-09-10 — Ownership needs proof; closing needs identity
+
+**Trigger**: Review of the persistence work above. Ownership had become the
+authority to close somebody's Access process, but the code answered "is this
+ours?" with heuristics that failed toward yes: `is_owned` accepted a record
+with no creation stamp, a failed `tasklist` looked identical to "no Access
+running" and silently wiped the registry, and closure resolved an instance by
+*path* and quit whatever came back. Two rebuild-blocking bugs sat alongside
+it: `GetObject(path)` launches Access when nothing holds the file, and that
+process was never registered; and every tool call loads the add-in as a
+library, which locks it, while the pre-flight matched only on open database.
+
+**Options explored**:
+- *Treat unconfirmed as owned, since the server usually is the one running
+  Access.* Rejected. The cost of a false positive is closing a user's window
+  with unsaved work; the cost of a false negative is a rebuild that refuses
+  and tells the user which window to close.
+- *Verify ownership by `UserControl` or window title instead of a registry.*
+  Rejected again (as in the entry above): owned instances deliberately set
+  `UserControl`, so it cannot distinguish them.
+- *Leave a hung owned instance alone and let the rebuild refuse.* Rejected on
+  the user's call: the instance is server-created, so unsaved state is
+  acceptable loss, and refusing leaves a window nobody can act on.
+- *Match the add-in by path at each of the fifteen `load_addin` call sites.*
+  Rejected. Recording it once inside `load_addin` covers every path through
+  the code, including ones added later.
+
+**Decision**: Ownership requires a confirmed `(pid, create_time)` match;
+every ambiguity resolves to "not ours". `list_access_pids_or_none()`
+distinguishes a failed process query from an empty one, and the registry
+keeps its records when liveness is unknowable. Closure re-verifies pid and
+creation time against the record before touching an instance, runs the
+graceful `Quit` in a worker thread under `ACCESS_VCS_CLOSE_TIMEOUT_SEC`
+(a blocking COM call here would hang the Access gate), then force-terminates
+a survivor. A record is dropped only once the process is confirmed gone.
+`load_addin` records the loaded add-in so rebuild pre-flight can close
+library holders, and that pre-flight moved inside the gate.
+
+**What this rules out**: Any ownership signal that is not the durable
+registry, and any close path that authorizes on a path match. Revisit the
+terminate policy if owned instances ever hold state a user would miss —
+today they do not, because the user's own windows are never server-created.
+
+**Relevant files**: `access_com/instance_registry.py`,
+`access_com/connection.py`, `access_com/process_qos.py`,
+`addin_integration.py`, `tools.py`, `vba_worker_manager.py`.
+
+---
+
 ## 2026-08-28 — Optional leave-open for COM-created Access
+
+> **⚠ Superseded** (2026-09-10): Persist-by-default plus a durable PID
+> registry replaced the opt-in flag as the default. The flag remains as an
+> explicit `false` to restore quit-per-call. The 2026-08-28 leak concern
+> assumed accumulation; GetObject reattach bounds the count to one window
+> per database. See "Persist server-created Access; own it by PID" above.
+
 
 **Trigger**: Sequential `msaccess-vcs run-tests` always Quit the Access the
 CLI child created, so there was no way to time a boosted process and then

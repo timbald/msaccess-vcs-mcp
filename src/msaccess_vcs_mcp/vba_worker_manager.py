@@ -15,7 +15,11 @@ try:
 except ImportError:
     COM_AVAILABLE = False
 
-from .access_com.connection import ensure_access_visible
+from .access_com.connection import (
+    AccessConnection,
+    ensure_access_visible,
+    recycle_owned_instance,
+)
 from .addin_integration import VCSAddinIntegration
 from .com_recovery import (
     classify_com_error,
@@ -228,6 +232,47 @@ class VBAWorkerManager:
             error=probe_result.get("error"),
             error_pattern=state.error_pattern,
         )
+
+        recycled = False
+        try:
+            recycled = recycle_owned_instance(database_path)
+        except Exception as exc:
+            log_diagnostic_event(
+                "owned_instance_recycle_failed",
+                database=str(database_path),
+                error=str(exc),
+            )
+            recycled = False
+
+        if recycled:
+            log_diagnostic_event(
+                "owned_instance_recycled",
+                database=str(database_path),
+            )
+            retry_probe = self.probe(database_path, addin_path)
+            if retry_probe.get("success"):
+                recovered = self.recovery.mark_healthy(database_path, recovered=True)
+                log_com_recovery_event(
+                    "com_recovery_probe_result",
+                    database_path=database_path,
+                    status=recovered.status,
+                    success=True,
+                )
+                log_diagnostic_event(
+                    "com_recovery_probe_result",
+                    database=str(database_path),
+                    status=recovered.status,
+                    success=True,
+                    recycled=True,
+                )
+                return None
+            state = self.recovery.mark_failure(
+                database_path,
+                retry_probe.get("error", "Access recovery probe failed after recycle"),
+                retry_probe.get("error_pattern"),
+                timed_out=retry_probe.get("timed_out", False),
+            )
+
         return self._recoverable_error(
             "Access is still not responding after a recovery probe.",
             state.error_pattern or "access_unresponsive",
@@ -379,13 +424,15 @@ class VBAWorkerManager:
                     retry=retry,
                 )
 
+            held_conn = None
+
             try:
                 if not COM_AVAILABLE:
                     raise ImportError("pywin32 is required for COM automation")
                 pythoncom.CoInitialize()
                 try:
                     set_phase("connect")
-                    worker_app = VCSAddinIntegration._find_access_in_rot(database_path)
+                    worker_app, held_conn = _find_or_open_access(database_path)
                     if worker_app is None:
                         raise RuntimeError(
                             f"Cannot find Access instance for {database_path} "
@@ -452,7 +499,9 @@ class VBAWorkerManager:
 
                     # Never carry pre-reset COM proxies into payload execution.
                     addin = None
-                    worker_app = VCSAddinIntegration._find_access_in_rot(database_path)
+                    worker_app, reacquired_conn = _find_or_open_access(database_path)
+                    if reacquired_conn is not None:
+                        held_conn = reacquired_conn
                     if worker_app is None:
                         raise RuntimeError(
                             f"Cannot reacquire Access instance for {database_path} "
@@ -474,6 +523,11 @@ class VBAWorkerManager:
                         "result": vba_result,
                     }
                 finally:
+                    if held_conn is not None:
+                        try:
+                            held_conn.close()
+                        except Exception:
+                            pass
                     try:
                         pythoncom.CoUninitialize()
                     except Exception:
@@ -584,6 +638,31 @@ class VBAWorkerManager:
         if phase:
             result["phase"] = phase
         return result
+
+
+def _find_or_open_access(database_path: str) -> tuple[Any, Any]:
+    """Return ``(app, connection)`` for ``database_path``, opening if needed.
+
+    The worker originally only looked in the Running Object Table. When
+    nothing held the file open -- including after the server quit its own
+    instance -- every ``vcs_run_vba`` failed with "Cannot find Access
+    instance".
+
+    Any connection opened here is returned rather than closed, and the
+    caller keeps it alive for the whole operation. Closing it immediately
+    would quit the instance under ``ACCESS_VCS_LEAVE_ACCESS_OPEN=false``,
+    leaving the ROT lookup on the next line to find nothing.
+    """
+    worker_app = VCSAddinIntegration._find_access_in_rot(database_path)
+    if worker_app is not None:
+        return worker_app, None
+    conn = AccessConnection(database_path)
+    try:
+        conn.connect()
+    except Exception:
+        conn.close()
+        raise
+    return VCSAddinIntegration._find_access_in_rot(database_path), conn
 
 
 _worker_manager = VBAWorkerManager()
