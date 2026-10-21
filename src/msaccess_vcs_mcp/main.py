@@ -121,13 +121,14 @@ def _log_server_shutdown() -> None:
     log_diagnostic_event("server_shutdown", session_id=_session_id)
 
 
-def _configure_sse(mcp, host: str, port: int) -> None:
-    """Point the SSE transport at host:port.
+def _configure_http(mcp, host: str, port: int) -> None:
+    """Point the network transports (SSE and Streamable HTTP) at host:port.
 
     FastMCP.run() takes no host or port (mcp 1.28 to 1.30): they are settings. The
     server object is built for 127.0.0.1, which also turns on the Host header check
     for localhost only, so a client on another machine would be refused. The check
-    stays on, with the one address listened on allowed as well.
+    stays on, with the one address listened on allowed as well. Both transports
+    read the same settings.
     """
     from mcp.server.transport_security import TransportSecuritySettings
 
@@ -144,6 +145,32 @@ def _configure_sse(mcp, host: str, port: int) -> None:
             "http://[::1]:*",
         ],
     )
+
+
+def _parse_transport_args(argv=None):
+    """Read --transport, --host and --port.
+
+    Without --transport the server uses stdio, unless --host or --port is given:
+    then it uses Streamable HTTP. ``http`` is another name for ``streamable-http``.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http", "http"])
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int)
+    args, _ = parser.parse_known_args(argv)
+
+    if args.transport is None:
+        network = args.host is not None or args.port is not None
+        args.transport = "streamable-http" if network else "stdio"
+    elif args.transport == "http":
+        args.transport = "streamable-http"
+    if args.host is None:
+        args.host = "127.0.0.1"
+    if args.port is None:
+        args.port = 8000
+    return args
 
 
 def main() -> None:
@@ -283,14 +310,9 @@ def main() -> None:
     )
 
     # Parse transport arguments
-    import argparse
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--transport", default="stdio", choices=["stdio", "sse"])
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8000)
-    args, _ = parser.parse_known_args()
+    args = _parse_transport_args()
 
-    if args.transport == "sse" and args.host in ("0.0.0.0", "::"):
+    if args.transport != "stdio" and args.host in ("0.0.0.0", "::"):
         print(
             "--host must be one address of this machine (for example its address on "
             "the network the client is on), not all of them",
@@ -300,13 +322,21 @@ def main() -> None:
 
     # Import and run MCP server
     from .tools import mcp
-    transport_label = f"mcp_{args.transport}_run"
+    transport_label = f"mcp_{args.transport.replace('-', '_')}_run"
     log_diagnostic_event(f"{transport_label}_start", session_id=_session_id)
     try:
         if args.transport == "sse":
-            _configure_sse(mcp, args.host, args.port)
+            _configure_http(mcp, args.host, args.port)
             print(f"Starting SSE server on {args.host}:{args.port}", file=sys.stderr)
             mcp.run(transport="sse")
+        elif args.transport == "streamable-http":
+            _configure_http(mcp, args.host, args.port)
+            print(
+                f"Starting Streamable HTTP server on {args.host}:{args.port}"
+                f"{mcp.settings.streamable_http_path}",
+                file=sys.stderr,
+            )
+            mcp.run(transport="streamable-http")
         else:
             mcp.run(transport="stdio")
         log_diagnostic_event(f"{transport_label}_returned", session_id=_session_id)

@@ -104,7 +104,7 @@ The `@latest` suffix ensures `uvx` always pulls the latest version from [PyPI](h
 claude mcp add msaccess-vcs-mcp -- uvx msaccess-vcs-mcp@latest
 ```
 
-**Client on another machine (SSE)** -- Access must run on Windows, but the MCP client need not run on the same machine. See [Running the Server for a Client on Another Machine](#running-the-server-for-a-client-on-another-machine).
+**Client on another machine (Streamable HTTP or SSE)** -- Access must run on Windows, but the MCP client need not run on the same machine. See [Running the Server for a Client on Another Machine](#running-the-server-for-a-client-on-another-machine).
 
 ### 4. Configure your database
 
@@ -196,15 +196,39 @@ The server prints diagnostics to stderr at startup (visible in Cursor's MCP serv
 
 ### Running the Server for a Client on Another Machine
 
-The default stdio transport needs the MCP client and Access on the same Windows machine. With `--transport sse`, the server runs on the Windows machine that has Access and the client connects to it across the network: Claude Code on a Mac or Linux machine, say, or on another Windows PC. The Windows machine can be a physical PC on the LAN or a VM on any platform (Parallels Desktop, Hyper-V, VMware, Proxmox and so on).
+The default stdio transport needs the MCP client and Access on the same Windows machine. For a remote client, run the server on the Windows machine that has Access and connect over Streamable HTTP. Legacy SSE remains available with `--transport sse`. The client can run on Windows, macOS, or Linux; the Access machine can be a physical PC or a VM (Parallels Desktop, Hyper-V, VMware, Proxmox and so on).
 
-On the Windows machine, in the logged-in session (not as a service, so Access can show its windows), start the server listening on that machine's own IP address:
+Set `ACCESS_VCS_PROJECT_DIR` to the project directory on the Windows machine containing the intended `.env` or `.env.local` before starting the server. The remote client's workspace path does not select a project on the server. Start the server in a logged-in Windows session (not as a service, so Access can show its windows), listening on that machine's own IP address:
 
 ```bash
-msaccess-vcs-mcp --transport sse --host 192.168.1.50 --port 8765
+msaccess-vcs-mcp --host 192.168.1.50 --port 8765
 ```
 
-On the client machine, use the same address:
+Specifying `--host` or `--port` selects Streamable HTTP unless `--transport` is explicit. Its endpoint is `http://192.168.1.50:8765/mcp`. For example, register it with Codex on the client machine:
+
+```bash
+codex mcp add msaccess-vcs-mcp --url http://192.168.1.50:8765/mcp
+```
+
+Claude Code can use the same endpoint:
+
+```bash
+claude mcp add --transport http msaccess-vcs-mcp http://192.168.1.50:8765/mcp
+```
+
+For Cursor, add the remote server to `~/.cursor/mcp.json` (or `.cursor/mcp.json` in the client project):
+
+```json
+{
+  "mcpServers": {
+    "msaccess-vcs-remote1": {
+      "url": "http://192.168.1.50:8765/mcp"
+    }
+  }
+}
+```
+
+For a client that requires legacy SSE, explicitly start `msaccess-vcs-mcp --transport sse --host 192.168.1.50 --port 8765` on the Windows machine and register its `/sse` endpoint instead. For example:
 
 ```bash
 claude mcp add --transport sse msaccess-vcs-mcp http://192.168.1.50:8765/sse
@@ -213,18 +237,31 @@ claude mcp add --transport sse msaccess-vcs-mcp http://192.168.1.50:8765/sse
 The server checks each request's `Host` header (protection against DNS rebinding) and accepts only the address it listens on, plus `localhost`, `127.0.0.1` and `[::1]`. That shapes the setup:
 
 - **One address.** `--host` defaults to `127.0.0.1`, and `0.0.0.0` / `::` are refused: the check needs a specific address to allow.
-- **The IP address in the URL, not a name.** A URL such as `http://win11.lan:8765/sse` sends `win11.lan` as the `Host` and is refused with `421 Misdirected Request`.
+- **The IP address in the URL, not a name.** A URL such as `http://win11.lan:8765/mcp` sends `win11.lan` as the `Host` and is refused with `421 Misdirected Request`.
 - **An address that does not change.** Give the Windows machine a static address or a DHCP reservation. If the address changes, restart the server with the new one.
 - **Reached directly, not through NAT.** A VM needs an address the client can route to: bridged onto the LAN, or the host-only / shared network of a desktop hypervisor when the client runs on that same host. Through a NAT port forward the client connects to the forwarding host's address, which the server cannot listen on, so it is refused (421).
-- **Otherwise, a tunnel.** Where none of that is possible, leave the server on `127.0.0.1` and forward a port over SSH (OpenSSH Server is an optional feature of Windows): `ssh -N -L 8765:127.0.0.1:8765 user@windows-machine` on the client, then `http://localhost:8765/sse`. `localhost` is always accepted, and only SSH is exposed.
+- **Otherwise, a tunnel.** Where none of that is possible, leave the server on `127.0.0.1` and forward a port over SSH (OpenSSH Server is an optional feature of Windows): `ssh -N -L 8765:127.0.0.1:8765 user@windows-machine` on the client, then connect to `http://localhost:8765/mcp`. `localhost` is always accepted, and only SSH is exposed.
 
-The SSE transport has **no authentication**: anyone who can reach the port can drive Access on that machine. Open the port in Windows Firewall to the client machine's address only, not the whole subnet:
+The network transports have **no authentication**: anyone who can reach the port can drive Access on that machine. Open the port in Windows Firewall to the client machine's address only, not the whole subnet:
 
 ```powershell
 New-NetFirewallRule -DisplayName "msaccess-vcs-mcp" -Direction Inbound -Protocol TCP -LocalPort 8765 -RemoteAddress 192.168.1.20 -Action Allow
 ```
 
 If the hypervisor has its own firewall switched on for the VM (Proxmox's, for example), it needs the same opening. Do not expose the port beyond the LAN; reach it over a VPN or an SSH tunnel instead.
+
+After connecting, call `vcs_get_version_info()` and verify the selected project and database before using database tools.
+
+#### Connecting to Multiple Windows Machines
+
+Run and configure the server separately on each Windows machine. Register each endpoint in the client with a distinct name so its tools identify the intended Access machine. For example:
+
+| MCP server name | Endpoint |
+| --- | --- |
+| `msaccess-vcs-remote1` | `http://192.168.1.50:8765/mcp` |
+| `msaccess-vcs-remote2` | `http://192.168.1.51:8765/mcp` |
+
+Give each machine its own reachable IP address, project configuration, and firewall rule for the client. If using SSH tunnels, use a different local port for each tunnel and register the matching `localhost` URL.
 
 ## Available Tools
 
